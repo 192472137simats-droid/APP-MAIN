@@ -1,0 +1,19 @@
+.env
+# Anchored: an unanchored "data/" also matches the Android app's data package.
+/data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.idea/
+.vscode/
+.DS_Store
+
+# built artifacts
+*.apk
+
+# local tooling
+.claude/
