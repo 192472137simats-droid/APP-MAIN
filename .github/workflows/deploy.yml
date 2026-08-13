@@ -1,0 +1,33 @@
+name: Deploy to Railway
+
+# Auto-deploys the app to Railway on every push to main.
+# Requires one repo secret: RAILWAY_TOKEN
+#   Railway → project research-advisor-lm → Settings → Tokens →
+#   create a PROJECT token (environment: production), then add it here under
+#   Settings → Secrets and variables → Actions → New repository secret.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::warning::RAILWAY_TOKEN secret is not set yet — add it in Settings → Secrets and variables → Actions, then re-run. Skipping deploy."
+            exit 0
+          fi
+          npm install -g @railway/cli
+          railway up --service web --ci
