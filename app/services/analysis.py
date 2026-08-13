@@ -3,7 +3,7 @@
 from typing import Any
 
 from . import citations, literature
-from .gemini_service import generate_from_images, generate_json, generate_text
+from .llm_service import generate_from_images, generate_json, generate_text
 
 # --------------------------------------------------------------------------
 # Schemas (OpenAPI subset accepted by Gemini's responseSchema)

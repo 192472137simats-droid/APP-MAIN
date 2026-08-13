@@ -13,13 +13,22 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "researchadvisor.db"
 
-# --- Gemini ---------------------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-# Pinned for reproducibility (you should be able to say which model produced
-# your results). If it is ever retired, the service falls back automatically -
-# see resolve_model() in services/gemini_service.py.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+# --- LLM (OpenAI-compatible) ----------------------------------------------
+# The app talks to any OpenAI-compatible /chat/completions API: OpenRouter
+# (default), Groq, Mistral, Cerebras, a local server, etc. Switch providers by
+# changing three env vars - no code change:
+#   LLM_BASE_URL   the provider's OpenAI-compatible base (…/v1)
+#   LLM_API_KEY    that provider's key
+#   LLM_MODEL      a model id the key can call
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b:free").strip()
+# Optional separate vision model for OCR of scanned PDFs (needs image input).
+# Empty -> OCR falls back to LLM_MODEL and errors clearly if it can't see.
+LLM_VISION_MODEL = os.getenv("LLM_VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl:free").strip()
+# OpenRouter reads these for attribution; other providers ignore them.
+LLM_APP_URL = os.getenv("LLM_APP_URL", "https://github.com/sai2610teja-dev/research-advisor-lm").strip()
+LLM_APP_TITLE = os.getenv("LLM_APP_TITLE", "ResearchAdvisorLM").strip()
 
 # --- Literature grounding -------------------------------------------------
 # OpenAlex asks for a contact address to get into the polite (faster) pool.

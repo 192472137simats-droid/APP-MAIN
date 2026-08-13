@@ -508,8 +508,8 @@ $("#run-compare").addEventListener("click", async () => {
 (async function boot() {
   try {
     const health = await api("/api/health");
-    if (!health.gemini_key_configured) {
-      showUploadError("GEMINI_API_KEY is not configured on the server. Set it in your .env file or Railway variables.");
+    if (!health.key_configured) {
+      showUploadError("No LLM_API_KEY configured on the server. Set it in your .env file or Railway variables.");
     }
     if (health.papers > 0) loadLibrary();
   } catch {

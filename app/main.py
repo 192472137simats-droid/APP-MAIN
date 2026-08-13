@@ -16,13 +16,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .config import GEMINI_API_KEY, GEMINI_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
+from .config import LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
 from .services import citations as citation_service
 from .services import export as export_service
 from .services import analysis as analysis_service
-from .services import gemini_service
+from .services import llm_service
 from .services import pdf_service
-from .services.gemini_service import GeminiError
+from .services.llm_service import LLMError
 from .services.pdf_service import PdfError
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -143,7 +143,7 @@ async def _ingest(data: bytes, filename: str) -> dict[str, Any]:
         try:
             images = pdf_service.render_pages(data, max_pages=OCR_MAX_PAGES)
             text = await analysis_service.transcribe_pages(images)
-        except (PdfError, GeminiError) as exc:
+        except (PdfError, LLMError) as exc:
             raise HTTPException(
                 422,
                 "This looks like a scanned PDF and it could not be transcribed: "
@@ -171,7 +171,7 @@ async def _ingest(data: bytes, filename: str) -> dict[str, Any]:
 
     try:
         result = await analysis_service.analyse_paper(extracted["body"])
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"AI analysis failed: {exc}") from exc
 
     paper_id = uuid.uuid4().hex[:12]
@@ -210,9 +210,10 @@ async def _ingest(data: bytes, filename: str) -> dict[str, Any]:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "model": GEMINI_MODEL,
-        "resolved_model": gemini_service.resolved_model_name(),
-        "gemini_key_configured": bool(GEMINI_API_KEY),
+        "model": LLM_MODEL,
+        "resolved_model": llm_service.resolved_model_name(),
+        "key_configured": bool(LLM_API_KEY),
+        "gemini_key_configured": bool(LLM_API_KEY),  # deprecated alias
         "papers": len(db.list_papers()),
     }
 
@@ -226,15 +227,15 @@ async def models() -> dict[str, Any]:
     the app has settled on.
     """
     try:
-        available = await gemini_service.available_models()
-        selected = await gemini_service.resolve_model()
-    except GeminiError as exc:
+        available = await llm_service.available_models()
+        selected = await llm_service.resolve_model()
+    except LLMError as exc:
         raise HTTPException(502, str(exc)) from exc
 
     return {
-        "configured": GEMINI_MODEL,
+        "configured": LLM_MODEL,
         "selected": selected,
-        "configured_is_available": any(m["name"] == GEMINI_MODEL for m in available),
+        "configured_is_available": any(m["name"] == LLM_MODEL for m in available),
         "available": available,
     }
 
@@ -306,7 +307,7 @@ async def ground(paper_id: str) -> dict[str, Any]:
 
     try:
         result = await analysis_service.ground_gaps(paper["analysis"])
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Gap validation failed: {exc}") from exc
 
     db.save_grounding(paper_id, result)
@@ -350,7 +351,7 @@ async def chat(request: ChatRequest) -> dict[str, str]:
     history = db.get_messages(request.paper_id, limit=12)
     try:
         answer = await analysis_service.answer_question(request.question, paper, history)
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Chat failed: {exc}") from exc
 
     db.add_message(request.paper_id, "user", request.question)
@@ -371,7 +372,7 @@ async def chat_library(request: LibraryChatRequest) -> dict[str, Any]:
 
     try:
         answer = await analysis_service.answer_across_library(request.question, papers)
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Library chat failed: {exc}") from exc
 
     return {"answer": answer, "papers_searched": len(papers)}
@@ -388,7 +389,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
 
     try:
         result = await analysis_service.compare_papers(papers_data)
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Comparison failed: {exc}") from exc
 
     result["papers"] = [
@@ -472,7 +473,7 @@ async def topic(paper_id: str, request: TopicRequest) -> dict[str, Any]:
 
     try:
         result = await analysis_service.generate_topic(analysis, gap)
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Topic generation failed: {exc}") from exc
 
     result["gap"] = {"id": gap.get("id"), "title": gap.get("title"), "verdict": gap.get("verdict")}
@@ -496,7 +497,7 @@ async def review(request: ReviewRequest) -> dict[str, Any]:
 
     try:
         return await analysis_service.generate_review(papers_data)
-    except GeminiError as exc:
+    except LLMError as exc:
         raise HTTPException(502, f"Literature review failed: {exc}") from exc
 
 # --------------------------------------------------------------------------
