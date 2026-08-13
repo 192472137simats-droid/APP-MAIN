@@ -61,7 +61,8 @@ for "what has other work done?" questions.
 **Compare** — 2–5 papers side by side, plus the most useful output: gaps that
 *none* of them address.
 
-**Export** — Markdown report with summary, gaps, verdicts and a citation list.
+**Export** — report download as Markdown, PDF or DOCX, with summary, gaps,
+verdicts and a citation list.
 
 ---
 
@@ -70,7 +71,7 @@ for "what has other work done?" questions.
 | Layer | Choice | Why |
 |---|---|---|
 | Backend | FastAPI | async, one service, trivial to deploy |
-| AI | Gemini Flash via REST | 1M context — a whole paper fits, no chunking needed |
+| LLM | OpenAI-compatible API (OpenRouter by default) | swap OpenRouter / Groq / Mistral / Cerebras / local via 3 env vars; large context fits a whole paper, no chunking |
 | PDF | PyMuPDF | fast, column-aware block extraction |
 | Literature | OpenAlex API | free, no key, ~250M works |
 | Storage | SQLite | zero-config; swap for Postgres when you need persistence |
@@ -89,13 +90,16 @@ literature corpus*, not over one document.
 python -m venv venv
 venv\Scripts\activate          # macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env           # then put your Gemini key in it
+cp .env.example .env           # then put your OpenRouter key in it
 uvicorn app.main:app --reload
 ```
 
 Open http://127.0.0.1:8000
 
-Get a free Gemini API key at <https://aistudio.google.com/apikey>.
+Get a free API key at <https://openrouter.ai/keys> (no card needed). The app
+speaks the OpenAI-compatible protocol, so you can point it at a different
+provider (Groq, Mistral, Cerebras, a local server) by setting `LLM_BASE_URL`
+and `LLM_MODEL` — see `.env.example`.
 
 ---
 
@@ -103,8 +107,8 @@ Get a free Gemini API key at <https://aistudio.google.com/apikey>.
 
 1. Push this repo to GitHub.
 2. Railway → **New Project → Deploy from GitHub repo** → pick the repo.
-3. **Variables** → add `GEMINI_API_KEY`. Optionally `OPENALEX_MAILTO` (your email —
-   gets you into OpenAlex's faster polite pool).
+3. **Variables** → add `LLM_API_KEY`. Optionally `LLM_MODEL`, `LLM_BASE_URL`, and
+   `OPENALEX_MAILTO` (your email — gets you into OpenAlex's faster polite pool).
 4. **Settings → Networking → Generate Domain**.
 
 `railway.json` and `Procfile` set the start command and a `/api/health` healthcheck.
@@ -119,7 +123,7 @@ Get a free Gemini API key at <https://aistudio.google.com/apikey>.
 ## Android app
 
 A native Kotlin + Jetpack Compose client lives in [`android/`](android). It talks to the
-same FastAPI backend, so the phone never sees the Gemini key.
+same FastAPI backend, so the phone never sees the LLM API key.
 
 **Build it:**
 
@@ -161,7 +165,7 @@ backend by editing `API_BASE_URL` in `android/app/build.gradle.kts`.
 | `DELETE` | `/api/papers/{id}` | delete paper and messages |
 | `POST` | `/api/chat` | `{paper_id, question}` → grounded answer |
 | `POST` | `/api/compare` | `{paper_ids: [...]}` → comparison table + shared gaps |
-| `GET` | `/api/papers/{id}/export` | Markdown report download |
+| `GET` | `/api/papers/{id}/export?format=md\|pdf\|docx` | report download (Markdown / PDF / DOCX) |
 
 Interactive docs at `/docs`.
 
@@ -171,8 +175,10 @@ Interactive docs at `/docs`.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `GEMINI_API_KEY` | — | **required** |
-| `GEMINI_MODEL` | `gemini-3.6-flash` | falls back automatically if retired; `GET /api/models` lists what your key can call |
+| `LLM_API_KEY` | — | **required** — your provider key (OpenRouter by default) |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | any OpenAI-compatible base (Groq, Mistral, Cerebras, local…) |
+| `LLM_MODEL` | `nvidia/nemotron-nano-9b-v2:free` | a model id the key can call; `GET /api/models` lists options |
+| `LLM_VISION_MODEL` | `nvidia/nemotron-nano-12b-v2-vl:free` | vision model used to OCR scanned PDFs |
 | `OPENALEX_MAILTO` | — | your email; faster OpenAlex pool |
 | `GROUNDING_CORPUS_SIZE` | `40` | papers retrieved per grounding run |
 | `MAX_UPLOAD_MB` | `25` | |
