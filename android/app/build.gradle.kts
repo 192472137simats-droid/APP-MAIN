@@ -22,7 +22,7 @@ android {
         buildConfigField(
             "String",
             "API_BASE_URL",
-            "\"https://web-production-80db2.up.railway.app\""
+            "\"https://web-production-e44093.up.railway.app\""
         )
     }
 
