@@ -20,6 +20,7 @@ from .config import LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
 from .services import citations as citation_service
 from .services import export as export_service
 from .services import analysis as analysis_service
+from .services import literature
 from .services import llm_service
 from .services import pdf_service
 from .services.llm_service import LLMError
@@ -499,6 +500,30 @@ async def review(request: ReviewRequest) -> dict[str, Any]:
         return await analysis_service.generate_review(papers_data)
     except LLMError as exc:
         raise HTTPException(502, f"Literature review failed: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Discover (Step 2) - topic -> ranked candidate papers.
+# Read-only: no SQLite writes, no LLM, no analysis, no grounding.
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/discover/search")
+async def discover_search(q: str = "", limit: int = 20) -> dict[str, Any]:
+    """Rank candidate papers for a topic query, straight from OpenAlex."""
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(400, "Query 'q' must not be empty.")
+    if len(query) > 300:
+        raise HTTPException(400, "Query 'q' is too long (max 300 characters).")
+
+    try:
+        results = await literature.search_topic(query, limit)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return {"query": query, "count": len(results), "results": results}
+
 
 # --------------------------------------------------------------------------
 # Static client (mounted last so /api/* wins)

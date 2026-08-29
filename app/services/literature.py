@@ -7,6 +7,7 @@ OpenAlex is free, needs no API key, and covers ~250M works.
 """
 
 import asyncio
+import math
 import re
 from typing import Any
 
@@ -182,3 +183,72 @@ async def build_corpus(
         "corpus_size": len(corpus),
         "queries": queries[:4],
     }
+
+
+# --------------------------------------------------------------------------
+# Topic-first discovery (Step 2): rank candidate papers for a free-text query.
+#
+# Read-only. Reuses the same search + normalisation path as grounding
+# (search_recent -> _work_to_dict), then deduplicates and ranks. No LLM, no
+# storage, and no change to find_work/citing_works/search_recent/build_corpus.
+# --------------------------------------------------------------------------
+
+DISCOVER_MAX_LIMIT = 50  # OpenAlex per-page ceiling / sane upper bound
+
+
+def _rank_topic_results(works: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rank relevance-first, then blend in citation and recency signals.
+
+    `works` arrives in OpenAlex relevance order (search_recent sorts by
+    relevance_score), so list position is the dominant signal; citation count
+    and recency only nudge the order and break ties. Adds a `rank_score` field
+    (same additive pattern build_corpus already uses for `ref`).
+    """
+    if not works:
+        return works
+    total = len(works)
+    years = [w["year"] for w in works if w.get("year")]
+    newest = max(years) if years else None
+    for index, work in enumerate(works):
+        relevance = total - index  # dominant term: preserves API relevance order
+        citations = math.log1p(max(work.get("citations") or 0, 0))
+        recency = 0.0
+        if newest and work.get("year"):
+            recency = max(0, 3 - (newest - work["year"]))  # small boost, last ~3 yrs
+        work["rank_score"] = round(relevance * 10 + citations + recency, 3)
+    return sorted(works, key=lambda w: w["rank_score"], reverse=True)
+
+
+async def search_topic(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """Topic -> ranked candidate papers. Read-only; reuses search_recent().
+
+    Returns normalised paper dicts (same shape as grounding results) with an
+    added `rank_score`, deduplicated and ranked. Raises ValueError on bad input.
+    """
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("query must be a non-empty string")
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    limit = max(1, min(limit, DISCOVER_MAX_LIMIT))
+
+    # Over-fetch a little so dedup/ranking has headroom, capped at the API max.
+    fetch = min(max(limit * 2, limit), DISCOVER_MAX_LIMIT)
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        # from_year=None -> topic search across all years, not only later work.
+        works = await search_recent(client, query, None, limit=fetch)
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for work in works:
+        key = work["openalex_id"] or work["title"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        work["source"] = "topic search"  # relabel for discovery; search_recent untouched
+        unique.append(work)
+
+    return _rank_topic_results(unique)[:limit]
