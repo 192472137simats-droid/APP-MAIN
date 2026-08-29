@@ -20,6 +20,7 @@ from .config import LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
 from .services import citations as citation_service
 from .services import export as export_service
 from .services import analysis as analysis_service
+from .services import discovery
 from .services import literature
 from .services import llm_service
 from .services import pdf_service
@@ -523,6 +524,34 @@ async def discover_search(q: str = "", limit: int = 20) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
 
     return {"query": query, "count": len(results), "results": results}
+
+
+class DiscoverRunRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=300)
+    goal: str = Field(default="gaps", max_length=40)
+    max_papers: int = Field(default=6, ge=1, le=50)
+    max_validations: int = Field(default=6, ge=1, le=20)
+
+
+@app.post("/api/discover/run")
+async def discover_run(request: DiscoverRunRequest) -> dict[str, Any]:
+    """Stage 6: run the bounded agentic discovery workflow for a topic.
+
+    Reuses paper analysis, OpenAlex grounding and the LLM service. Bounded by
+    hard caps (papers, LLM calls, iterations, wall-clock) so it can never run
+    away. Does not modify any existing paper/library data.
+    """
+    try:
+        return await discovery.run_discovery(
+            request.query,
+            goal=request.goal,
+            max_papers=request.max_papers,
+            max_validations=request.max_validations,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LLMError as exc:
+        raise HTTPException(502, f"Discovery failed: {exc}") from exc
 
 
 # --------------------------------------------------------------------------
