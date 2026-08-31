@@ -28,7 +28,7 @@ from typing import Any, Callable
 import httpx
 
 from . import analysis, literature
-from .llm_service import LLMError, generate_json
+from .llm_service import UNTRUSTED_RULE, LLMError, fence_untrusted, generate_json
 
 # --------------------------------------------------------------------------
 # Hard limits (env-overridable). Defaults are conservative on purpose so a run
@@ -41,7 +41,12 @@ MAX_VALIDATIONS = int(os.getenv("DISCOVERY_MAX_VALIDATIONS", "6"))
 MAX_LLM_CALLS = int(os.getenv("DISCOVERY_MAX_LLM_CALLS", "40"))
 MAX_ITERATIONS = int(os.getenv("DISCOVERY_MAX_ITERATIONS", "2"))
 MIN_PAPERS = int(os.getenv("DISCOVERY_MIN_PAPERS", "3"))
-DEADLINE_SECONDS = float(os.getenv("DISCOVERY_DEADLINE_SECONDS", "900"))
+# Measured 2026-08-31 on nvidia/nemotron-3.5-lightning:free: a 4-paper run
+# spends ~10.5 min analysing and ~3.5 min synthesising, so a 900s deadline
+# starved validation and returned "unverified" gaps - the one verdict the
+# product must not default to. Runs execute in the background and are polled,
+# so a longer ceiling costs nothing but wall-clock.
+DEADLINE_SECONDS = float(os.getenv("DISCOVERY_DEADLINE_SECONDS", "2400"))
 VALIDATION_CORPUS_SIZE = int(os.getenv("DISCOVERY_VALIDATION_CORPUS", "12"))
 
 ProgressCb = Callable[[str, dict[str, Any]], None] | None
@@ -207,6 +212,7 @@ Rules:
 - `affected_methods` / `affected_datasets`: only those named in the observations.
 - `confidence` reflects how consistently the clusters' papers raise this - not certainty.
 - Do NOT claim anything is novel; that is decided later by validation.
+- {untrusted_rule}
 
 CLUSTERS:
 {clusters}"""
@@ -307,7 +313,10 @@ async def synthesize_gaps(
         try:
             budget.spend(1)
             merged = await generate_json(
-                _SYNTHESIS_PROMPT.format(clusters="\n\n".join(blocks)),
+                _SYNTHESIS_PROMPT.format(
+                    clusters=fence_untrusted("\n\n".join(blocks)),
+                    untrusted_rule=UNTRUSTED_RULE,
+                ),
                 _SYNTHESIS_SCHEMA, temperature=0.2,
             )
         except (LLMError, BudgetExceeded):
@@ -315,7 +324,10 @@ async def synthesize_gaps(
     else:
         try:
             merged = await generate_json(
-                _SYNTHESIS_PROMPT.format(clusters="\n\n".join(blocks)),
+                _SYNTHESIS_PROMPT.format(
+                    clusters=fence_untrusted("\n\n".join(blocks)),
+                    untrusted_rule=UNTRUSTED_RULE,
+                ),
                 _SYNTHESIS_SCHEMA, temperature=0.2,
             )
         except LLMError:
@@ -379,6 +391,7 @@ Rules:
 - `contradicting_refs`: papers showing it is (partly) SOLVED.
 - Never call a gap novel merely because the corpus lacks a solution - use "unverified".
 - `what_remains`: one sentence on what a new project could still contribute.
+- {untrusted_rule}
 
 CORPUS ({n} papers):
 {corpus}"""
@@ -404,6 +417,12 @@ def _validation_queries(gap: dict[str, Any]) -> list[str]:
 
 
 def _format_corpus(corpus: list[dict[str, Any]]) -> str:
+    """Render retrieved papers for a prompt.
+
+    Titles and abstracts come from OpenAlex, so they are attacker-controllable:
+    publishing a preprint is enough to put chosen text in front of the model.
+    The block is fenced so it cannot act as an instruction.
+    """
     lines = []
     for work in corpus:
         authors = ", ".join((work.get("authors") or [])[:2]) or "unknown"
@@ -412,7 +431,7 @@ def _format_corpus(corpus: list[dict[str, Any]]) -> str:
             f"[{work['ref']}] {work.get('title')} ({work.get('year', 'n.d.')}) - {authors}"
             f" - {work.get('citations', 0)} citations\n    {abstract}"
         )
-    return "\n".join(lines) or "(no papers retrieved)"
+    return fence_untrusted("\n".join(lines) or "(no papers retrieved)")
 
 
 async def validate_gap(
@@ -470,10 +489,12 @@ async def validate_gap(
     try:
         verdict = await generate_json(
             _VALIDATION_PROMPT.format(
-                title=gap.get("title", ""),
-                description=gap.get("description", ""),
+                # Gap text is derived from paper content, so it is untrusted too.
+                title=fence_untrusted(gap.get("title", ""), limit=300),
+                description=fence_untrusted(gap.get("description", ""), limit=1200),
                 n=len(corpus),
                 corpus=_format_corpus(corpus),
+                untrusted_rule=UNTRUSTED_RULE,
             ),
             _VALIDATION_SCHEMA, temperature=0.1,
         )

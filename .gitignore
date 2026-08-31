@@ -1,4 +1,7 @@
 .env
+# Backups and per-environment copies carry the same live key as .env.
+.env.*
+!.env.example
 # Anchored: an unanchored "data/" also matches the Android app's data package.
 /data/
 *.db

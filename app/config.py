@@ -22,10 +22,12 @@ DB_PATH = DATA_DIR / "researchadvisor.db"
 #   LLM_MODEL      a model id the key can call
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/nemotron-nano-9b-v2:free").strip()
+# Free model ids get retired without notice: nemotron-nano-9b-v2 now 404s.
+# Check GET {LLM_BASE_URL}/models before trusting this default.
+LLM_MODEL = os.getenv("LLM_MODEL", "nvidia/nemotron-3.5-lightning:free").strip()
 # Optional separate vision model for OCR of scanned PDFs (needs image input).
 # Empty -> OCR falls back to LLM_MODEL and errors clearly if it can't see.
-LLM_VISION_MODEL = os.getenv("LLM_VISION_MODEL", "nvidia/nemotron-nano-12b-v2-vl:free").strip()
+LLM_VISION_MODEL = os.getenv("LLM_VISION_MODEL", "minimax/minimax-m3:free").strip()
 # OpenRouter reads these for attribution; other providers ignore them.
 LLM_APP_URL = os.getenv("LLM_APP_URL", "https://github.com/sai2610teja-dev/research-advisor-lm").strip()
 LLM_APP_TITLE = os.getenv("LLM_APP_TITLE", "ResearchAdvisorLM").strip()

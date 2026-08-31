@@ -3,7 +3,13 @@
 from typing import Any
 
 from . import citations, literature
-from .llm_service import generate_from_images, generate_json, generate_text
+from .llm_service import (
+    UNTRUSTED_RULE,
+    fence_untrusted,
+    generate_from_images,
+    generate_json,
+    generate_text,
+)
 
 # --------------------------------------------------------------------------
 # Schemas (OpenAPI subset accepted by Gemini's responseSchema)
@@ -135,6 +141,7 @@ ANALYSIS_PROMPT = """You are an expert research analyst. Analyse the research pa
 
 Produce a faithful structured analysis. Rules:
 - Use ONLY what the paper states. Never invent numbers, datasets, baselines or citations.
+- {rule}
 - `metadata.authors`: the author names printed under the title on the first page,
   in order, as "First Last". These are almost always present even when no
   "Authors:" label appears - look at the lines between the title and the
@@ -166,7 +173,7 @@ PAPER:
 
 async def analyse_paper(body: str) -> dict[str, Any]:
     return await generate_json(
-        ANALYSIS_PROMPT.format(paper=body),
+        ANALYSIS_PROMPT.format(paper=fence_untrusted(body), rule=UNTRUSTED_RULE),
         ANALYSIS_SCHEMA,
         temperature=0.2,
     )
@@ -309,6 +316,7 @@ Rules:
 - Never invent numbers, citations or results.
 - Name the section you drew the answer from, like (Section: Results).
 - Be direct. Two or three sentences unless the question needs more.
+- {rule}
 {extra_context}
 PAPER: {title}
 ---
@@ -341,9 +349,10 @@ async def answer_question(
         extra = RELATED_BLOCK.format(corpus=_format_corpus(corpus[:15]))
 
     prompt = CHAT_PROMPT.format(
+        rule=UNTRUSTED_RULE,
         extra_context=extra,
         title=title,
-        paper=paper.get("full_text", "")[:180000],
+        paper=fence_untrusted(paper.get("full_text", ""), limit=180000),
         question=question,
     )
     return await generate_text(prompt, history=history, temperature=0.3)
@@ -365,6 +374,8 @@ the most valuable output, be specific.
 `contradictions`: places where the papers disagree, if any.
 `synthesis`: 3-4 sentences on where this line of research currently stands and
 what a new project could contribute.
+
+{rule}
 
 PAPERS:
 {papers}"""
@@ -599,6 +610,7 @@ every paper in this library.
 Answer using only what is below. Cite papers by title. If the library does not
 contain the answer, say so plainly and name what it does cover instead.
 Never invent papers, numbers or findings.
+{rule}
 
 LIBRARY ({count} papers):
 {papers}
