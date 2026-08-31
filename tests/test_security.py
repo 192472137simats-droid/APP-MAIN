@@ -120,6 +120,61 @@ def test_paper_mode_prompts_still_format():
     )
 
 
+# --- novelty by absence ---------------------------------------------------
+
+
+def _gap(verdict, supporting=0, contradicting=0, frequency=3, confidence="high"):
+    work = {"title": "t", "url": "u"}
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "frequency": frequency,
+        "supporting_evidence": [work] * supporting,
+        "contradicting_evidence": [work] * contradicting,
+    }
+
+
+def test_unevidenced_open_gap_scores_below_an_evidenced_one():
+    """The bug the eval caught: a gap with no evidence at all ranked second."""
+    evidenced, _ = discovery._score(_gap("open", supporting=2))
+    unevidenced, _ = discovery._score(_gap("open", supporting=0))
+
+    assert unevidenced < evidenced
+
+
+def test_unevidenced_open_scores_no_higher_than_unverified():
+    unevidenced, _ = discovery._score(_gap("open", supporting=0))
+    unverified, _ = discovery._score(_gap("unverified", supporting=0))
+
+    assert unevidenced <= unverified
+
+
+def test_absent_evidence_is_not_scored_as_uncontradicted():
+    """Nothing retrieved means nothing checked - not a clean bill of health."""
+    _, breakdown = discovery._score(_gap("open", supporting=0, contradicting=0))
+    assert breakdown["not_contradicted"] == 0.5
+
+    _, checked = discovery._score(_gap("open", supporting=2, contradicting=0))
+    assert checked["not_contradicted"] == 1.0
+
+
+def test_evidenced_gap_scoring_is_unchanged():
+    """The fix must not penalise gaps that did come back with evidence."""
+    score, breakdown = discovery._score(_gap("open", supporting=4, contradicting=0))
+    assert breakdown["unresolved"] == 1.0
+    assert breakdown["evidence_strength"] == 1.0
+    assert score > 90
+
+
+def test_validation_failure_does_not_store_provider_error():
+    """Raw provider text can carry internal ids and is persisted and exported."""
+    import inspect
+
+    source = inspect.getsource(discovery.validate_gap)
+    assert 'f"Validation LLM call failed: {exc}"' not in source
+    assert "logger.warning" in source
+
+
 # --- SSRF -----------------------------------------------------------------
 
 

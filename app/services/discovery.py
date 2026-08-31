@@ -19,6 +19,7 @@ Design principles (see the product roadmap):
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import re
@@ -29,6 +30,8 @@ import httpx
 
 from . import analysis, literature
 from .llm_service import UNTRUSTED_RULE, LLMError, fence_untrusted, generate_json
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Hard limits (env-overridable). Defaults are conservative on purpose so a run
@@ -499,7 +502,14 @@ async def validate_gap(
             _VALIDATION_SCHEMA, temperature=0.1,
         )
     except LLMError as exc:
-        result["reasoning"] = f"Validation LLM call failed: {exc}"
+        # The provider's message can carry internal ids and account details,
+        # and this field is persisted and exported as research reasoning, so
+        # only the failure itself is recorded.
+        logger.warning("Gap validation LLM call failed: %s", exc)
+        result["reasoning"] = (
+            "Validation could not be completed: the model call failed, so this "
+            "gap is unproven rather than confirmed open."
+        )
         progress("gap_validated", {"id": gap.get("id"), "verdict": "unverified"})
         return result
 
@@ -561,11 +571,30 @@ GAPS:
 
 
 def _score(gap: dict[str, Any]) -> tuple[float, dict[str, float]]:
-    verdict = _VERDICT_WEIGHT.get(gap.get("verdict", "unverified"), 0.4)
+    """Score a validated gap.
+
+    Two rules stop an absence of results from reading as evidence of novelty:
+    an "open" verdict with no supporting paper scores no higher than
+    "unverified", and the not-contradicted axis stays neutral when nothing was
+    retrieved to contradict in the first place.
+    """
+    supporting = gap.get("supporting_evidence") or []
+    contradicting = gap.get("contradicting_evidence") or []
+    verdict_name = gap.get("verdict", "unverified")
+
+    verdict = _VERDICT_WEIGHT.get(verdict_name, 0.4)
+    if verdict_name in ("open", "partial") and not supporting:
+        # Nothing was found showing the problem is real and still unsolved, so
+        # this is an unevidenced claim rather than a confirmed opportunity.
+        verdict = min(verdict, _VERDICT_WEIGHT["unverified"])
+
     confidence = _CONFIDENCE_WEIGHT.get(gap.get("confidence", "low"), 0.33)
     frequency = min(1.0, math.log1p(gap.get("frequency", 1)) / math.log(6))
-    contradicted = 1.0 - min(1.0, 0.5 * len(gap.get("contradicting_evidence") or []))
-    support = min(1.0, 0.25 * len(gap.get("supporting_evidence") or []))
+    if supporting or contradicting:
+        contradicted = 1.0 - min(1.0, 0.5 * len(contradicting))
+    else:
+        contradicted = 0.5  # nothing checked: neither contradicted nor clear
+    support = min(1.0, 0.25 * len(supporting))
     breakdown = {
         "unresolved": round(verdict, 3),
         "recurrence": round(frequency, 3),
@@ -624,6 +653,9 @@ async def rank_opportunities(
                        "Not found addressed in the validation corpus checked.")
         gap.setdefault("feasibility", "medium")
         gap["score_is_system_generated"] = True
+        # Explicit so the UI and the eval harness can separate a confirmed
+        # opportunity from one nothing was found to support.
+        gap["evidence_backed"] = bool(gap.get("supporting_evidence"))
     progress("opportunities_ranked", {"count": len(ranked)})
     return ranked
 
