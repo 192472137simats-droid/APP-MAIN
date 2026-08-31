@@ -1133,9 +1133,6 @@ async function openProject(projectId) {
     if (!health.key_configured) {
       showUploadError("No LLM_API_KEY configured on the server. Set it in your .env file or Railway variables.");
     }
-    $("#model-info").textContent = health.resolved_model
-      ? `Model: ${health.resolved_model}`
-      : `Model: ${health.model}${health.key_configured ? "" : " · no API key configured"}`;
     if (health.papers > 0) loadLibrary();
   } catch {
     /* server not reachable yet */
