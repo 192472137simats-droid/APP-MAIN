@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,9 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     db.init()
+    # Discovery runs live in this process; any left "running" died with the
+    # previous one and would otherwise poll for ever.
+    db.reap_orphaned_runs()
 
 
 # --------------------------------------------------------------------------
@@ -85,6 +88,10 @@ class ImportRequest(BaseModel):
 _ARXIV_ABS = re.compile(r"arxiv\.org/abs/([^\s?#]+)", re.IGNORECASE)
 _ARXIV_ID = re.compile(r"^(?:arxiv:)?(\d{4}\.\d{4,5}(?:v\d+)?)$", re.IGNORECASE)
 _DOI = re.compile(r"^(?:doi:)?(10\.\d{4,9}/\S+)$", re.IGNORECASE)
+
+
+# DOI links legitimately chain (doi.org -> publisher -> CDN), so allow a few.
+_MAX_REDIRECTS = 5
 
 
 def _normalise_paper_url(raw: str) -> str:
@@ -272,19 +279,45 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
 async def import_from_url(request: ImportRequest) -> dict[str, Any]:
     """Ingest a paper straight from an arXiv or DOI link."""
     url = _normalise_paper_url(request.url.strip())
+    limit = MAX_UPLOAD_MB * 1024 * 1024
 
+    # Redirects are followed by hand: httpx's follow_redirects would leave only
+    # the first URL vetted, so a public link could bounce the fetch to
+    # 169.254.169.254 or a private host and defeat _normalise_paper_url.
     try:
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-            response = await client.get(url, headers={"User-Agent": "ResearchAdvisorLM/1.0"})
+        async with httpx.AsyncClient(timeout=120, follow_redirects=False) as client:
+            for _ in range(_MAX_REDIRECTS + 1):
+                async with client.stream(
+                    "GET", url, headers={"User-Agent": "ResearchAdvisorLM/1.0"}
+                ) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise HTTPException(502, "That URL redirected without a target.")
+                        url = _normalise_paper_url(str(response.url.join(location)))
+                        continue
+
+                    if response.status_code != 200:
+                        raise HTTPException(
+                            502, f"That URL returned HTTP {response.status_code}."
+                        )
+
+                    # Read incrementally: trusting Content-Length would let a
+                    # hostile server stream unbounded data into memory.
+                    chunks, total = [], 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > limit:
+                            raise HTTPException(
+                                413, f"That PDF exceeds the {MAX_UPLOAD_MB} MB limit."
+                            )
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    break
+            else:
+                raise HTTPException(502, "That URL redirected too many times.")
     except httpx.RequestError as exc:
         raise HTTPException(502, f"Could not fetch that URL: {exc}") from exc
-
-    if response.status_code != 200:
-        raise HTTPException(502, f"That URL returned HTTP {response.status_code}.")
-
-    data = response.content
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"That PDF exceeds the {MAX_UPLOAD_MB} MB limit.")
     if not data.startswith(b"%PDF"):
         raise HTTPException(
             422,
@@ -552,6 +585,147 @@ async def discover_run(request: DiscoverRunRequest) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
     except LLMError as exc:
         raise HTTPException(502, f"Discovery failed: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Discovery projects (Stage 7) - save a research question, run discovery
+# against it in the background, leave, come back and read the result.
+# --------------------------------------------------------------------------
+
+
+class ProjectRequest(BaseModel):
+    topic: str = Field(min_length=1, max_length=300)
+    goal: str = Field(default="gaps", max_length=40)
+
+
+class ProjectRunRequest(BaseModel):
+    max_papers: int = Field(default=6, ge=1, le=50)
+    max_validations: int = Field(default=6, ge=1, le=20)
+
+
+@app.post("/api/discover/projects")
+async def create_project(request: ProjectRequest) -> dict[str, Any]:
+    project_id = db.create_project(request.topic.strip(), request.goal.strip() or "gaps")
+    return {"project": db.get_project(project_id)}
+
+
+@app.get("/api/discover/projects")
+async def list_projects() -> dict[str, Any]:
+    projects = db.list_projects()
+    return {"count": len(projects), "projects": projects}
+
+
+@app.get("/api/discover/projects/{project_id}")
+async def get_project(project_id: str) -> dict[str, Any]:
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found.")
+    return {"project": project, "runs": db.list_runs(project_id)}
+
+
+@app.delete("/api/discover/projects/{project_id}")
+async def delete_project(project_id: str) -> dict[str, Any]:
+    if db.get_project(project_id) is None:
+        raise HTTPException(404, "Project not found.")
+    db.delete_project(project_id)
+    return {"deleted": project_id}
+
+
+async def _execute_run(
+    run_id: str, project: dict[str, Any], max_papers: int, max_validations: int
+) -> None:
+    """Drive one discovery run, streaming progress into the run's trace.
+
+    Runs detached from the request, so a full pipeline (many LLM calls) never
+    holds an HTTP connection open. Every exit path writes a terminal status,
+    otherwise a run would sit at `running` for ever.
+    """
+    try:
+        result = await discovery.run_discovery(
+            project["topic"],
+            goal=project["goal"],
+            max_papers=max_papers,
+            max_validations=max_validations,
+            on_progress=lambda step, data: db.append_run_step(run_id, step, data),
+        )
+        db.finish_run(run_id, result)
+    except (LLMError, ValueError, httpx.HTTPError) as exc:
+        db.fail_run(run_id, f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - a crash must not strand the run
+        db.fail_run(run_id, f"Unexpected error: {type(exc).__name__}: {exc}")
+
+
+@app.post("/api/discover/projects/{project_id}/runs")
+async def start_project_run(
+    project_id: str, request: ProjectRunRequest, background: BackgroundTasks
+) -> dict[str, Any]:
+    project = db.get_project(project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found.")
+
+    run_id = db.create_run(
+        project_id,
+        project["topic"],
+        project["goal"],
+        request.max_papers,
+        request.max_validations,
+    )
+    background.add_task(
+        _execute_run, run_id, project, request.max_papers, request.max_validations
+    )
+    return {"run": db.get_run(run_id)}
+
+
+@app.get("/api/discover/runs/{run_id}")
+async def get_run(run_id: str) -> dict[str, Any]:
+    run = db.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "Run not found.")
+    return {"run": run}
+
+
+class ChallengeRequest(BaseModel):
+    gap_id: str = Field(min_length=1, max_length=120)
+
+
+@app.post("/api/discover/runs/{run_id}/challenge")
+async def challenge_gap(run_id: str, request: ChallengeRequest) -> dict[str, Any]:
+    """Re-run adversarial validation for one opportunity in a finished run.
+
+    The point of the feature is that a verdict is a claim, not a fact: the user
+    can force the system to search again and try to disprove it. The verdict can
+    move in either direction, including from `open` to `addressed`.
+    """
+    run = db.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "Run not found.")
+
+    result = run.get("result") or {}
+    opportunities = result.get("opportunities") or []
+    index = next(
+        (i for i, o in enumerate(opportunities) if str(o.get("id")) == request.gap_id), None
+    )
+    if index is None:
+        raise HTTPException(404, "Gap not found in this run.")
+
+    try:
+        revalidated = await discovery.validate_gap(
+            opportunities[index], budget=discovery.Budget()
+        )
+        # Re-score through the public ranker; no budget means no LLM prose call,
+        # so a challenge costs only the validation search.
+        rescored = await discovery.rank_opportunities([revalidated], budget=None)
+    except LLMError as exc:
+        raise HTTPException(502, f"Challenge failed: {exc}") from exc
+
+    # Keep the prose the original ranking produced; validation does not regenerate it.
+    updated = {**opportunities[index], **rescored[0]}
+    opportunities[index] = updated
+    opportunities.sort(key=lambda o: o.get("system_score") or 0, reverse=True)
+    result["opportunities"] = opportunities
+    db.finish_run(run_id, result)
+
+    return {"gap": updated, "run": db.get_run(run_id)}
 
 
 # --------------------------------------------------------------------------

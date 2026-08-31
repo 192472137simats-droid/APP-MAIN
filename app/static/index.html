@@ -20,6 +20,7 @@
   </div>
   <nav class="topnav">
     <button class="navbtn" data-nav="upload">Upload</button>
+    <button class="navbtn" data-nav="discover">Discover</button>
     <button class="navbtn" data-nav="library">Library</button>
     <button class="navbtn" data-nav="compare">Compare</button>
   </nav>
@@ -44,6 +45,12 @@
       <button class="btn primary" id="browse-btn">Browse PDF</button>
       <input type="file" id="file-input" accept="application/pdf" hidden />
     </div>
+
+    <form class="import-row" id="import-form">
+      <input id="import-url" class="ask-input" maxlength="2000" autocomplete="off"
+             placeholder="…or paste an arXiv link, DOI, or direct PDF URL" />
+      <button class="btn" type="submit" id="import-btn">Import</button>
+    </form>
 
     <div id="progress" class="progress hidden">
       <div class="step" data-step="extract"><span class="dot"></span> Extracting text</div>
@@ -71,8 +78,10 @@
       <div id="paper-warnings"></div>
       <div class="paper-actions">
         <button class="btn ghost" id="export-btn">Export report</button>
+        <button class="btn ghost" id="cite-btn">Cite</button>
         <button class="btn ghost danger" id="delete-btn">Delete</button>
       </div>
+      <div id="citation-box"></div>
     </div>
 
     <div class="tabs">
@@ -104,7 +113,100 @@
       <h1>Library</h1>
       <button class="btn primary" data-nav="upload">+ Add paper</button>
     </div>
+
+    <form class="import-row" id="libchat-form">
+      <input id="libchat-text" class="ask-input" maxlength="2000" autocomplete="off"
+             placeholder="Ask across every paper in your library…" />
+      <button class="btn" type="submit" id="libchat-btn">Ask</button>
+    </form>
+    <div id="libchat-answer"></div>
+
     <div id="library-list" class="cards"></div>
+
+    <div class="view-head projects-head">
+      <h2>Related-work review</h2>
+      <button class="btn ghost" id="review-btn">Generate from selected</button>
+    </div>
+    <p class="sub">Select 2–10 papers below, then generate a themed review with citations.</p>
+    <div id="review-picker" class="cards"></div>
+    <div id="review-result"></div>
+  </section>
+
+  <!-- ================= DISCOVER ================= -->
+  <section id="view-discover" class="view hidden">
+    <div class="hero">
+      <h1>Start from the <em>question</em>, not the paper.</h1>
+      <p class="sub">
+        Name a research area. The system reads the literature, finds the problems papers
+        keep leaving unsolved, then argues against each one before ranking what's left.
+      </p>
+    </div>
+
+    <form id="discover-form" class="ask">
+      <label class="ask-label" for="discover-topic">What are you researching?</label>
+      <input id="discover-topic" class="ask-input" maxlength="300" autocomplete="off"
+             placeholder="LLM hallucination detection" />
+
+      <fieldset class="goals">
+        <legend class="ask-label">Research goal</legend>
+        <label class="goal">
+          <input type="radio" name="goal" value="gaps" checked />
+          <span class="goal-name">Find research gaps</span>
+          <span class="goal-hint">Unsolved problems that survive a challenge</span>
+        </label>
+        <label class="goal">
+          <input type="radio" name="goal" value="review" />
+          <span class="goal-name">Literature review</span>
+          <span class="goal-hint">What the field currently agrees on</span>
+        </label>
+        <label class="goal">
+          <input type="radio" name="goal" value="opportunities" />
+          <span class="goal-name">Research opportunities</span>
+          <span class="goal-hint">Ranked directions worth starting</span>
+        </label>
+      </fieldset>
+
+      <button class="btn primary" type="submit" id="start-discovery">Start discovery</button>
+      <p class="ask-note">
+        A run reads up to 6 papers and is capped on time and model calls, so it can't run away.
+      </p>
+    </form>
+
+    <div id="discover-error" class="alert error hidden"></div>
+
+    <div class="view-head projects-head">
+      <h2>Saved research</h2>
+    </div>
+    <div id="projects-list" class="cards"></div>
+  </section>
+
+  <!-- ================= DISCOVERY RUN ================= -->
+  <section id="view-run" class="view hidden">
+    <button class="backlink" data-nav="discover">← Discover</button>
+
+    <div class="paper-head">
+      <h1 id="run-topic">—</h1>
+      <div id="run-meta" class="meta-row"></div>
+      <div class="paper-actions">
+        <button class="btn ghost" id="rerun-btn">Run again</button>
+        <button class="btn ghost danger" id="delete-project-btn">Delete project</button>
+      </div>
+    </div>
+
+    <div id="run-progress" class="progress">
+      <div class="step" data-step="question_understood"><span class="dot"></span> Research question understood</div>
+      <div class="step" data-step="papers_discovered"><span class="dot"></span> Literature search completed</div>
+      <div class="step" data-step="papers_selected"><span class="dot"></span> Relevant papers selected</div>
+      <div class="step" data-step="papers_analysed"><span class="dot"></span> Papers analysed</div>
+      <div class="step" data-step="gaps_synthesised"><span class="dot"></span> Candidate gaps identified</div>
+      <div class="step" data-step="gaps_selected_for_validation"><span class="dot"></span> Gaps challenged</div>
+      <div class="step" data-step="opportunities_ranked"><span class="dot"></span> Opportunities ranked</div>
+    </div>
+
+    <div id="run-error" class="alert error hidden"></div>
+    <div id="run-banner"></div>
+    <div id="opportunities"></div>
+    <div id="run-history"></div>
   </section>
 
   <!-- ================= COMPARE ================= -->
@@ -119,6 +221,10 @@
   </section>
 
 </main>
+
+<footer class="footer">
+  <span id="model-info">—</span>
+</footer>
 
 <div id="toast" class="toast hidden"></div>
 

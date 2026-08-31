@@ -7,6 +7,11 @@ const state = {
   paper: null,       // full paper object currently open
   depth: "short",
   compareIds: new Set(),
+  project: null,     // discovery project currently open
+  run: null,         // discovery run currently shown
+  pollTimer: null,   // handle for the run-status poll
+  navigated: false,  // true once the user picks a view themselves
+  reviewIds: new Set(),
 };
 
 /* ---------------- helpers ---------------- */
@@ -58,8 +63,12 @@ function resetSteps() {
 $$("[data-nav]").forEach((el) =>
   el.addEventListener("click", () => {
     const view = el.dataset.nav;
+    state.navigated = true;
+    // Leaving a run must stop its poll, or it keeps firing in the background.
+    if (view !== "run") stopPolling();
     if (view === "library") loadLibrary();
     if (view === "compare") loadComparePicker();
+    if (view === "discover") loadProjects();
     show(view);
   })
 );
@@ -318,9 +327,21 @@ function renderGaps() {
             : ""
         }
         ${gap.what_remains ? `<div class="remains"><b>What a new project could do:</b> ${esc(gap.what_remains)}</div>` : ""}
+        ${
+          verdict === "open" || verdict === "partial"
+            ? `<div class="opp-actions">
+                 <button class="btn ghost" data-propose="${esc(gap.id ?? index)}">Turn into a project</button>
+               </div>
+               <div class="proposal"></div>`
+            : ""
+        }
       </div>`;
       })
       .join("") || `<div class="empty">No gaps identified.</div>`;
+
+  $$("#gaps-list [data-propose]").forEach((btn) =>
+    btn.addEventListener("click", () => proposeProject(btn.dataset.propose, btn))
+  );
 }
 
 async function groundNow() {
@@ -437,6 +458,8 @@ async function loadLibrary() {
   $$("#library-list .card").forEach((card) =>
     card.addEventListener("click", () => openPaper(card.dataset.id))
   );
+
+  loadReviewPicker(papers);
 }
 
 /* ---------------- compare ---------------- */
@@ -503,6 +526,605 @@ $("#run-compare").addEventListener("click", async () => {
   }
 });
 
+/* ---------------- import by URL ---------------- */
+
+$("#import-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const url = $("#import-url").value.trim();
+  if (!url) return;
+
+  const button = $("#import-btn");
+  button.disabled = true;
+  button.textContent = "Importing…";
+  $("#upload-error").classList.add("hidden");
+  $("#progress").classList.remove("hidden");
+  resetSteps();
+  setStep("extract", "active");
+
+  try {
+    const result = await api("/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    setStep("extract", "done");
+    setStep("analyze", "done");
+    $("#import-url").value = "";
+    await openPaper(result.paper_id, result.warnings);
+    await groundInBackground(result.paper_id);
+  } catch (err) {
+    showUploadError(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Import";
+    setTimeout(() => $("#progress").classList.add("hidden"), 1200);
+  }
+});
+
+async function groundInBackground(paperId) {
+  setStep("search", "active");
+  try {
+    const grounding = await api(`/api/papers/${paperId}/ground`, { method: "POST" });
+    setStep("search", "done");
+    setStep("validate", "done");
+    state.paper.grounding = grounding;
+    renderGaps();
+    toast(`Checked ${grounding.corpus_size} papers from the literature`);
+  } catch (err) {
+    setStep("search", "");
+    toast(`Gap grounding failed: ${err.message}`);
+  }
+}
+
+/* ---------------- citations ---------------- */
+
+$("#cite-btn").addEventListener("click", async () => {
+  const box = $("#citation-box");
+  if (box.innerHTML) return (box.innerHTML = "");
+
+  try {
+    const styles = await api(`/api/papers/${state.paper.id}/citation`);
+    box.innerHTML = `<div class="block">${Object.entries(styles)
+      .map(
+        ([name, text]) => `
+        <div class="cite-row">
+          <span class="cite-style">${esc(name)}</span>
+          <span class="cite-text">${esc(text)}</span>
+          <button class="btn ghost" data-copy="${esc(text)}">Copy</button>
+        </div>`
+      )
+      .join("")}</div>`;
+
+    $$("#citation-box [data-copy]").forEach((btn) =>
+      btn.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        toast("Citation copied");
+      })
+    );
+  } catch (err) {
+    toast(err.message, 4000);
+  }
+});
+
+/* ---------------- gap -> project proposal ---------------- */
+
+async function proposeProject(gapId, button) {
+  const holder = button.closest(".gap").querySelector(".proposal");
+  button.disabled = true;
+  button.textContent = "Drafting…";
+  try {
+    const p = await api(`/api/papers/${state.paper.id}/topic`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gap_id: gapId }),
+    });
+    const list = (items) =>
+      `<ul>${(items || []).map((i) => `<li>${esc(i)}</li>`).join("")}</ul>`;
+    holder.innerHTML = `
+      <div class="block">
+        <h3>${esc(p.title || "Project proposal")}</h3>
+        <h4>Problem</h4><p>${esc(p.problem || "")}</p>
+        <h4>Why it is open</h4><p>${esc(p.why_it_is_open || "")}</p>
+        <h4>Proposed approach</h4><p>${esc(p.proposed_approach || "")}</p>
+        <h4>Datasets</h4><div class="tag-row">${(p.datasets || [])
+          .map((d) => `<span class="tag">${esc(d)}</span>`)
+          .join("")}</div>
+        <h4>Evaluation plan</h4><p>${esc(p.evaluation_plan || "")}</p>
+        <h4>Expected contribution</h4><p>${esc(p.expected_contribution || "")}</p>
+        <h4>Prerequisites</h4>${list(p.prerequisites)}
+        <h4>Risks</h4>${list(p.risks)}
+        ${p.difficulty ? `<span class="chip">difficulty: ${esc(p.difficulty)}</span>` : ""}
+      </div>`;
+    button.textContent = "Proposal drafted";
+  } catch (err) {
+    toast(err.message, 4000);
+    button.disabled = false;
+    button.textContent = "Turn into a project";
+  }
+}
+
+/* ---------------- library chat ---------------- */
+
+$("#libchat-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = $("#libchat-text").value.trim();
+  if (!question) return;
+
+  const button = $("#libchat-btn");
+  const answer = $("#libchat-answer");
+  button.disabled = true;
+  button.textContent = "Thinking…";
+  answer.innerHTML = `<div class="msg assistant thinking">Reading your library…</div>`;
+
+  try {
+    const result = await api("/api/chat/library", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    answer.innerHTML = `
+      <div class="msg assistant">${esc(result.answer)}</div>
+      <p class="ev-meta">Answered from ${result.papers_searched} paper${
+        result.papers_searched === 1 ? "" : "s"
+      } in your library.</p>`;
+  } catch (err) {
+    answer.innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Ask";
+  }
+});
+
+/* ---------------- related-work review ---------------- */
+
+function loadReviewPicker(papers) {
+  $("#review-picker").innerHTML = papers.length
+    ? papers
+        .map(
+          (p) => `
+        <div class="card ${state.reviewIds.has(p.id) ? "selected" : ""}" data-id="${p.id}">
+          <div class="card-title">${esc(p.title || p.filename)}</div>
+          <div class="card-meta">${
+            p.year ? `<span>${esc(p.year)}</span>` : ""
+          }<span>${p.pages}p</span></div>
+        </div>`
+        )
+        .join("")
+    : `<div class="empty">Add at least two papers to generate a review.</div>`;
+
+  $$("#review-picker .card").forEach((card) =>
+    card.addEventListener("click", () => {
+      const id = card.dataset.id;
+      if (state.reviewIds.has(id)) state.reviewIds.delete(id);
+      else if (state.reviewIds.size >= 10) return toast("Maximum of 10 papers");
+      else state.reviewIds.add(id);
+      card.classList.toggle("selected");
+    })
+  );
+}
+
+$("#review-btn").addEventListener("click", async () => {
+  if (state.reviewIds.size < 2) return toast("Select at least 2 papers");
+  const button = $("#review-btn");
+  button.disabled = true;
+  button.textContent = "Writing…";
+  $("#review-result").innerHTML = "";
+
+  try {
+    const result = await api("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paper_ids: [...state.reviewIds] }),
+    });
+    const themes = (result.themes || [])
+      .map(
+        (t) => `
+        <div class="block">
+          <h3>${esc(t.name || "Theme")}</h3>
+          <p>${esc(t.discussion || "")}</p>
+          ${
+            (t.papers || []).length
+              ? `<div class="tag-row">${t.papers
+                  .map((p) => `<span class="tag">${esc(p)}</span>`)
+                  .join("")}</div>`
+              : ""
+          }
+        </div>`
+      )
+      .join("");
+    $("#review-result").innerHTML = `
+      ${
+        result.introduction
+          ? `<div class="block"><h3>Introduction</h3><p>${esc(result.introduction)}</p></div>`
+          : ""
+      }
+      ${themes}`;
+  } catch (err) {
+    $("#review-result").innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Generate from selected";
+  }
+});
+
+/* ---------------- discovery ---------------- */
+
+// The pipeline emits more steps than the checklist shows; each checklist row is
+// marked done once its own step has been seen in the trace.
+const RUN_STEPS = [
+  "question_understood",
+  "papers_discovered",
+  "papers_selected",
+  "papers_analysed",
+  "gaps_synthesised",
+  "gaps_selected_for_validation",
+  "opportunities_ranked",
+];
+
+const SCORE_LABEL = {
+  unresolved: "Still unresolved",
+  recurrence: "Recurs across papers",
+  evidence_strength: "Evidence strength",
+  not_contradicted: "Not contradicted",
+  confidence: "Validator confidence",
+};
+
+const GOAL_LABEL = {
+  gaps: "Find research gaps",
+  review: "Literature review",
+  opportunities: "Research opportunities",
+};
+
+function resetRunSteps() {
+  RUN_STEPS.forEach((s) => setStep(s, ""));
+}
+
+function renderRunProgress(run) {
+  const seen = new Set((run.trace || []).map((t) => t.step));
+  const finished = run.status !== "running";
+  let active = false;
+
+  RUN_STEPS.forEach((name) => {
+    if (seen.has(name)) return setStep(name, "done");
+    if (!finished && !active) {
+      active = true;
+      return setStep(name, "active");
+    }
+    setStep(name, "");
+  });
+}
+
+function evidenceList(items) {
+  return (
+    (items || [])
+      .map(
+        (w) => `
+      <div class="ev-item">
+        <a href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.title)}</a>
+        <div class="ev-meta">${esc((w.authors || []).join(", "))} · ${esc(w.year || "n.d.")}
+          · ${w.citations ?? 0} citations${w.venue ? " · " + esc(w.venue) : ""}</div>
+      </div>`
+      )
+      .join("") || `<div class="ev-item ev-meta">Nothing found.</div>`
+  );
+}
+
+function scoreBlock(opportunity) {
+  const breakdown = opportunity.score_breakdown || {};
+  const parts = Object.entries(breakdown)
+    .map(
+      ([key, value]) => `
+      <div class="score-part">
+        <span>${esc(SCORE_LABEL[key] || key)}</span>
+        <span class="score-track"><span class="score-fill" style="width:${Math.round(
+          Math.max(0, Math.min(1, Number(value) || 0)) * 100
+        )}%"></span></span>
+        <span class="score-num">${(Number(value) || 0).toFixed(2)}</span>
+      </div>`
+    )
+    .join("");
+
+  if (!parts) return "";
+
+  return `
+    <div class="score">
+      <div class="score-top">
+        <span>Why it ranked here</span>
+        <span class="score-value">${
+          Number.isFinite(Number(opportunity.system_score))
+            ? Number(opportunity.system_score).toFixed(1)
+            : "—"
+        }</span>
+      </div>
+      <div class="score-parts">${parts}</div>
+      <p class="score-note">
+        A system-generated score out of 100, from the signals above — not a measure of
+        scientific merit.
+      </p>
+    </div>`;
+}
+
+function opportunityCard(opportunity, index) {
+  const verdict = opportunity.verdict || "unverified";
+  const supporting = opportunity.supporting_evidence || [];
+  const contradicting = opportunity.contradicting_evidence || [];
+  const frequency = opportunity.frequency ?? 1;
+  // The pipeline reports a failed or skipped validation by writing the reason
+  // into `reasoning` and leaving the verdict unverified. Showing that as a
+  // verdict would dress up an infrastructure failure as a research finding.
+  const validationFailed =
+    verdict === "unverified" &&
+    /^(Validation LLM call failed|Validation skipped|No later literature)/.test(
+      opportunity.reasoning || ""
+    );
+
+  return `
+    <div class="gap opp ${verdict}" style="animation-delay:${Math.min(index, 8) * 45}ms">
+      <div class="opp-rank">Opportunity ${index + 1}</div>
+      <div class="gap-top">
+        <div class="gap-title">${esc(opportunity.title)}</div>
+        <span class="verdict ${verdict}">${VERDICT_LABEL[verdict] || verdict}</span>
+      </div>
+      <div class="gap-meta">
+        <span class="chip">${esc(opportunity.category || "general")}</span>
+        <span class="chip">seen in ${frequency} paper${frequency === 1 ? "" : "s"}</span>
+        <span class="chip">confidence: ${esc(opportunity.confidence || "low")}</span>
+        <span class="chip">feasibility: ${esc(opportunity.feasibility || "medium")}</span>
+      </div>
+
+      <p>${esc(opportunity.description)}</p>
+      ${opportunity.why_it_matters ? `<p><b>Why it matters:</b> ${esc(opportunity.why_it_matters)}</p>` : ""}
+      ${
+        validationFailed
+          ? `<div class="alert warn">The challenge could not run, so this gap is
+               <b>unproven</b> rather than confirmed open.
+               <br /><span class="ev-meta">${esc(opportunity.reasoning)}</span></div>`
+          : opportunity.reasoning
+            ? `<p><b>Challenge result:</b> ${esc(opportunity.reasoning)}</p>`
+            : ""
+      }
+      ${opportunity.novelty_assessment ? `<p class="quote">${esc(opportunity.novelty_assessment)}</p>` : ""}
+
+      <details class="evidence">
+        <summary>${supporting.length} paper${supporting.length === 1 ? "" : "s"} supporting this gap</summary>
+        ${evidenceList(supporting)}
+      </details>
+      ${
+        contradicting.length
+          ? `<details class="evidence contra">
+               <summary>${contradicting.length} paper${
+                 contradicting.length === 1 ? "" : "s"
+               } arguing it is already addressed</summary>
+               ${evidenceList(contradicting)}
+             </details>`
+          : ""
+      }
+
+      ${scoreBlock(opportunity)}
+
+      ${
+        opportunity.suggested_next_step || opportunity.what_remains
+          ? `<div class="remains"><b>Suggested next step:</b> ${esc(
+              opportunity.suggested_next_step || opportunity.what_remains
+            )}</div>`
+          : ""
+      }
+
+      <div class="opp-actions">
+        <button class="btn ghost" data-challenge="${esc(opportunity.id)}">Challenge this gap</button>
+      </div>
+    </div>`;
+}
+
+function renderRun(run) {
+  $("#run-topic").textContent = run.query;
+
+  const chips = [
+    GOAL_LABEL[run.goal] || run.goal,
+    run.status === "running" ? "Running…" : run.status === "done" ? "Complete" : "Stopped",
+    run.llm_calls ? `${run.llm_calls} model calls` : null,
+  ].filter(Boolean);
+  $("#run-meta").innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+
+  renderRunProgress(run);
+
+  const error = $("#run-error");
+  if (run.status === "error" && run.error) {
+    error.textContent = run.error;
+    error.classList.remove("hidden");
+  } else {
+    error.classList.add("hidden");
+  }
+
+  const result = run.result || {};
+  const opportunities = result.opportunities || [];
+
+  if (run.status === "running") {
+    $("#run-banner").innerHTML = `
+      <div class="alert info">Reading the literature. This takes a few minutes —
+      you can leave and come back; the run keeps going.</div>`;
+  } else if (opportunities.length) {
+    $("#run-banner").innerHTML = `
+      <div class="alert info">
+        <b>${opportunities.length}</b> opportunit${opportunities.length === 1 ? "y" : "ies"}
+        survived challenge, from <b>${result.candidate_gaps ?? 0}</b> candidate gaps across
+        <b>${result.papers_analysed ?? 0}</b> analysed papers.
+        <br /><span class="ev-meta">A bounded corpus, not the whole literature — nothing here
+        is novel merely because this search did not find it.</span>
+      </div>`;
+  } else {
+    $("#run-banner").innerHTML = "";
+  }
+
+  $("#opportunities").innerHTML = opportunities.length
+    ? opportunities.map(opportunityCard).join("")
+    : run.status === "running"
+      ? ""
+      : `<div class="empty">No opportunities survived validation for this topic.</div>`;
+
+  $$("#opportunities [data-challenge]").forEach((btn) =>
+    btn.addEventListener("click", () => challengeGap(run.id, btn.dataset.challenge, btn))
+  );
+}
+
+async function pollRun(runId) {
+  const { run } = await api(`/api/discover/runs/${runId}`);
+  state.run = run;
+  renderRun(run);
+
+  if (run.status === "running") {
+    state.pollTimer = setTimeout(() => pollRun(runId), 2500);
+  } else if (run.status === "done") {
+    toast(`Discovery complete — ${run.llm_calls} model calls`);
+  }
+}
+
+function stopPolling() {
+  clearTimeout(state.pollTimer);
+}
+
+async function openRun(runId, project) {
+  stopPolling();
+  if (project) state.project = project;
+  resetRunSteps();
+  $("#run-error").classList.add("hidden");
+  $("#opportunities").innerHTML = "";
+  $("#run-banner").innerHTML = "";
+  show("run");
+  await pollRun(runId);
+}
+
+async function challengeGap(runId, gapId, button) {
+  button.disabled = true;
+  button.textContent = "Searching for counter-evidence…";
+  try {
+    const { run } = await api(`/api/discover/runs/${runId}/challenge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gap_id: gapId }),
+    });
+    state.run = run;
+    renderRun(run);
+    toast("Verdict re-checked against the literature");
+  } catch (err) {
+    toast(err.message, 4000);
+    button.disabled = false;
+    button.textContent = "Challenge this gap";
+  }
+}
+
+$("#discover-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const topic = $("#discover-topic").value.trim();
+  const errorBox = $("#discover-error");
+  errorBox.classList.add("hidden");
+
+  if (!topic) {
+    errorBox.textContent = "Enter a research topic to start.";
+    return errorBox.classList.remove("hidden");
+  }
+
+  const button = $("#start-discovery");
+  button.disabled = true;
+  button.textContent = "Starting…";
+
+  try {
+    // Browsers restore form state across reloads, so never assume the HTML
+    // default survived.
+    const goal = document.querySelector('input[name="goal"]:checked')?.value || "gaps";
+    const { project } = await api("/api/discover/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic, goal }),
+    });
+    const { run } = await api(`/api/discover/projects/${project.id}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    $("#discover-topic").value = "";
+    await openRun(run.id, project);
+  } catch (err) {
+    errorBox.textContent = err.message;
+    errorBox.classList.remove("hidden");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Start discovery";
+  }
+});
+
+$("#rerun-btn").addEventListener("click", async () => {
+  if (!state.project) return;
+  const button = $("#rerun-btn");
+  button.disabled = true;
+  button.textContent = "Starting…";
+  try {
+    const { run } = await api(`/api/discover/projects/${state.project.id}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    await openRun(run.id);
+  } catch (err) {
+    toast(err.message, 4000);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Run again";
+  }
+});
+
+$("#delete-project-btn").addEventListener("click", async () => {
+  if (!state.project) return;
+  if (!confirm("Delete this research project and every run inside it?")) return;
+  stopPolling();
+  await api(`/api/discover/projects/${state.project.id}`, { method: "DELETE" });
+  toast("Project deleted");
+  await loadProjects();
+  show("discover");
+});
+
+async function loadProjects() {
+  // Browsers restore radio state across reloads, which can leave a goal
+  // selected that the user never picked. Re-assert the documented default.
+  $('input[name="goal"][value="gaps"]').checked = true;
+
+  const { projects } = await api("/api/discover/projects");
+  $("#projects-list").innerHTML = projects.length
+    ? projects
+        .map(
+          (p) => `
+        <div class="card" data-project="${esc(p.id)}">
+          <div class="card-title">${esc(p.topic)}</div>
+          <div class="card-meta">
+            <span>${p.run_count} run${p.run_count === 1 ? "" : "s"}</span>
+            ${p.last_status ? `<span>${esc(p.last_status)}</span>` : "<span>not run yet</span>"}
+          </div>
+        </div>`
+        )
+        .join("")
+    : `<div class="empty">No saved research yet. Ask a question above to start.</div>`;
+
+  $$("#projects-list .card").forEach((card) =>
+    card.addEventListener("click", () => openProject(card.dataset.project))
+  );
+}
+
+async function openProject(projectId) {
+  const { project, runs } = await api(`/api/discover/projects/${projectId}`);
+  state.project = project;
+  if (runs.length) return openRun(runs[0].id, project);
+
+  // A saved question that was never run: show it ready to go, not a dead end.
+  stopPolling();
+  resetRunSteps();
+  $("#run-topic").textContent = project.topic;
+  $("#run-meta").innerHTML = "";
+  $("#run-error").classList.add("hidden");
+  $("#run-banner").innerHTML = `<div class="alert info">This project has no runs yet.</div>`;
+  $("#opportunities").innerHTML = "";
+  show("run");
+}
+
 /* ---------------- boot ---------------- */
 
 (async function boot() {
@@ -511,9 +1133,14 @@ $("#run-compare").addEventListener("click", async () => {
     if (!health.key_configured) {
       showUploadError("No LLM_API_KEY configured on the server. Set it in your .env file or Railway variables.");
     }
+    $("#model-info").textContent = health.resolved_model
+      ? `Model: ${health.resolved_model}`
+      : `Model: ${health.model}${health.key_configured ? "" : " · no API key configured"}`;
     if (health.papers > 0) loadLibrary();
   } catch {
     /* server not reachable yet */
   }
-  show("upload");
+  // The health check is awaited, so the user may already have navigated by now;
+  // landing them back on Upload would undo a click they made deliberately.
+  if (!state.navigated) show("upload");
 })();
