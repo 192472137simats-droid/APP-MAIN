@@ -160,6 +160,87 @@ class _Report(FPDF):
         self.cell(0, 8, f"Page {self.page_no()}/{{nb}}", align="C")
 
 
+def discovery_markdown(run: dict[str, Any]) -> str:
+    """A discovery run as a shareable report.
+
+    Every claim sits next to its evidence, and a gap nothing was found to
+    support is labelled unproven rather than listed quietly alongside the
+    confirmed ones.
+    """
+    result = run.get("result") or {}
+    opportunities = result.get("opportunities") or []
+
+    lines = [
+        f"# Research opportunities: {run.get('query', 'Untitled topic')}",
+        "",
+        f"- Papers analysed: {result.get('papers_analysed', 0)}",
+        f"- Candidate gaps: {result.get('candidate_gaps', 0)}",
+        f"- Surviving opportunities: {len(opportunities)}",
+        f"- Model calls: {run.get('llm_calls', 0)}",
+        f"- Run completed: {run.get('updated_at', 'unknown')}",
+        "",
+        "> Scores are system-generated from retrieval and validation signals, not a "
+        "measure of scientific merit. The literature searched is a bounded corpus: "
+        "nothing here is novel merely because this search did not find it.",
+        "",
+    ]
+
+    for index, opportunity in enumerate(opportunities, start=1):
+        supporting = opportunity.get("supporting_evidence") or []
+        contradicting = opportunity.get("contradicting_evidence") or []
+
+        lines += [
+            f"## {index}. {opportunity.get('title', 'Untitled gap')}",
+            "",
+            f"**Verdict:** {VERDICT_LABEL.get(opportunity.get('verdict'), 'UNVERIFIED')}"
+            f"  |  **Score:** {opportunity.get('system_score', '-')}/100"
+            f"  |  **Confidence:** {opportunity.get('confidence', 'low')}"
+            f"  |  **Seen in:** {opportunity.get('frequency', 1)} paper(s)",
+            "",
+            opportunity.get("description", ""),
+            "",
+        ]
+
+        if not supporting:
+            lines += [
+                "> No supporting paper was found for this gap, so it is unproven "
+                "rather than confirmed open.",
+                "",
+            ]
+        if opportunity.get("why_it_matters"):
+            lines += [f"**Why it matters.** {opportunity['why_it_matters']}", ""]
+        if opportunity.get("reasoning"):
+            lines += [f"**Challenge result.** {opportunity['reasoning']}", ""]
+        if opportunity.get("suggested_next_step") or opportunity.get("what_remains"):
+            step = opportunity.get("suggested_next_step") or opportunity["what_remains"]
+            lines += [f"**Suggested next step.** {step}", ""]
+
+        for label, works in (
+            ("Supporting evidence", supporting),
+            ("Evidence it may already be addressed", contradicting),
+        ):
+            if works:
+                lines += [f"**{label}**", ""]
+                for work in works:
+                    authors = ", ".join((work.get("authors") or [])[:3])
+                    lines.append(
+                        f"- {work.get('title', 'Untitled')} - {authors or 'unknown'} "
+                        f"({work.get('year', 'n.d.')}), {work.get('citations', 0)} "
+                        f"citations. {work.get('url', '')}".rstrip()
+                    )
+                lines.append("")
+
+    if not opportunities:
+        lines += ["No opportunities survived validation for this topic.", ""]
+
+    return "\n".join(lines)
+
+
+def safe_discovery_filename(run: dict[str, Any], extension: str) -> str:
+    stem = re.sub(r"[^a-z0-9]+", "-", (run.get("query") or "discovery").lower())
+    return f"{stem.strip('-')[:60] or 'discovery'}.{extension}"
+
+
 def pdf(paper: dict[str, Any]) -> bytes:
     analysis, metadata, gaps, grounding = _fields(paper)
     styles = citations.build(metadata)

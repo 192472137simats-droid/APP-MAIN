@@ -15,7 +15,7 @@ from app.services import discovery
 
 
 @pytest.fixture(autouse=True)
-def memory_db():
+def memory_db_local():
     """Point the db module at a fresh in-memory database for each test."""
     previous = db._conn
     conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -28,8 +28,15 @@ def memory_db():
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(memory_db_local):
+    """Signed in: every /api route except health and auth requires a session."""
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/auth/register",
+            json={"email": "tester@example.com", "password": "a-good-test-password"},
+        )
+        assert response.status_code == 200, response.text
+        yield test_client
 
 
 def _make_project(client, topic="LLM hallucination detection", goal="gaps"):
@@ -182,6 +189,100 @@ def test_delete_project_endpoint(client):
 
     assert client.delete(f"/api/discover/projects/{project['id']}").status_code == 200
     assert client.get(f"/api/discover/projects/{project['id']}").status_code == 404
+
+
+def _finished_run(client, monkeypatch, papers=None, opportunities=None):
+    """A completed run, with the pipeline stubbed so nothing is spent."""
+
+    async def fake_run(query, *, goal, max_papers, max_validations, on_progress=None):
+        return {
+            "query": query,
+            "goal": goal,
+            "papers": papers or [],
+            "papers_analysed": len(papers or []),
+            "candidate_gaps": 2,
+            "opportunities": opportunities or [],
+            "llm_calls": 4,
+        }
+
+    monkeypatch.setattr(discovery, "run_discovery", fake_run)
+    project = _make_project(client)
+    return client.post(
+        f"/api/discover/projects/{project['id']}/runs", json={}
+    ).json()["run"]
+
+
+def test_export_renders_evidence_and_the_caveat(client, monkeypatch):
+    run = _finished_run(
+        client, monkeypatch,
+        opportunities=[{
+            "id": "g1", "title": "Detectors are not evaluated under shift",
+            "description": "d", "verdict": "open", "system_score": 80.2,
+            "supporting_evidence": [
+                {"title": "SelfCheckGPT", "authors": ["P. M."], "year": 2023,
+                 "citations": 720, "url": "https://openalex.org/W1"}
+            ],
+        }],
+    )
+
+    response = client.get(f"/api/discover/runs/{run['id']}/export")
+    body = response.text
+
+    assert response.status_code == 200
+    assert "Detectors are not evaluated under shift" in body
+    assert "SelfCheckGPT" in body
+    assert "STILL OPEN" in body
+    assert "not a measure of scientific merit" in body
+
+
+def test_export_flags_an_unevidenced_gap_as_unproven(client, monkeypatch):
+    run = _finished_run(
+        client, monkeypatch,
+        opportunities=[{"id": "g1", "title": "No evidence gap", "description": "d",
+                        "verdict": "open", "supporting_evidence": []}],
+    )
+
+    body = client.get(f"/api/discover/runs/{run['id']}/export").text
+    assert "unproven rather than confirmed open" in body
+
+
+def test_export_rejects_unsupported_formats(client, monkeypatch):
+    run = _finished_run(client, monkeypatch)
+    assert (
+        client.get(f"/api/discover/runs/{run['id']}/export?format=pdf").status_code == 400
+    )
+
+
+def test_saving_a_discovered_paper_adds_it_to_the_library(client, monkeypatch):
+    run = _finished_run(
+        client, monkeypatch,
+        papers=[{"id": "W1", "title": "Semantic Entropy", "abstract": "A" * 200,
+                 "authors": ["S. Farquhar"], "year": 2024, "cited_by_count": 300}],
+    )
+
+    async def fake_analyse(_body):
+        return {"metadata": {"title": "Semantic Entropy"}, "gaps": []}
+
+    from app.services import analysis as analysis_service
+
+    monkeypatch.setattr(analysis_service, "analyse_paper", fake_analyse)
+
+    response = client.post(
+        f"/api/discover/runs/{run['id']}/save-paper", json={"paper_index": 0}
+    )
+    assert response.status_code == 200
+    assert response.json()["abstract_only"] is True
+
+    library = client.get("/api/papers").json()
+    assert [p["title"] for p in library] == ["Semantic Entropy"]
+
+
+def test_saving_an_out_of_range_paper_is_404(client, monkeypatch):
+    run = _finished_run(client, monkeypatch, papers=[])
+    response = client.post(
+        f"/api/discover/runs/{run['id']}/save-paper", json={"paper_index": 3}
+    )
+    assert response.status_code == 404
 
 
 def test_start_run_executes_pipeline_and_stores_result(client, monkeypatch):

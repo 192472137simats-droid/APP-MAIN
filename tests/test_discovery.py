@@ -207,10 +207,10 @@ def test_run_discovery_rejects_empty_query():
 
 # --- API endpoint ----------------------------------------------------------
 
-client = TestClient(app)
 
 
-def test_discover_run_endpoint(monkeypatch):
+def test_discover_run_endpoint(monkeypatch, auth_client):
+    client = auth_client
     _patch_all(monkeypatch, [_work(f"W{i}", f"Paper {i}") for i in range(4)])
     resp = client.post("/api/discover/run", json={"query": "graph neural networks", "max_papers": 2})
     assert resp.status_code == 200
@@ -219,6 +219,7 @@ def test_discover_run_endpoint(monkeypatch):
     assert "opportunities" in data and "trace" in data
 
 
-def test_discover_run_endpoint_empty_query():
+def test_discover_run_endpoint_empty_query(auth_client):
+    client = auth_client
     # whitespace passes Pydantic min_length but run_discovery rejects it -> 400
     assert client.post("/api/discover/run", json={"query": "  "}).status_code == 400

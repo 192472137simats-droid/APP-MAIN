@@ -16,7 +16,7 @@ from app.services import discovery, llm_service
 
 
 @pytest.fixture(autouse=True)
-def memory_db():
+def memory_db_local():
     previous = db._conn
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -28,8 +28,15 @@ def memory_db():
 
 
 @pytest.fixture
-def client():
-    return TestClient(app)
+def client(memory_db_local):
+    """Signed in: every /api route except health and auth requires a session."""
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/api/auth/register",
+            json={"email": "tester@example.com", "password": "a-good-test-password"},
+        )
+        assert response.status_code == 200, response.text
+        yield test_client
 
 
 # --- untrusted content ----------------------------------------------------

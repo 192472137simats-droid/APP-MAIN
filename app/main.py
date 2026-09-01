@@ -1,17 +1,29 @@
 """ResearchAdvisorLM - FastAPI backend + web client in one deployable service."""
 
 import ipaddress
+import os
 import re
 import socket
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -20,6 +32,7 @@ from .config import LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
 from .services import citations as citation_service
 from .services import export as export_service
 from .services import analysis as analysis_service
+from .services import auth
 from .services import discovery
 from .services import literature
 from .services import llm_service
@@ -35,12 +48,100 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Credentials now ride on a cookie, so "*" is no longer allowed: browsers
+# reject wildcard origins on credentialed requests, and it would let any site
+# drive this API as the signed-in user. Set ALLOWED_ORIGINS for a separate
+# frontend; same-origin (the bundled client) needs no entry.
+_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --------------------------------------------------------------------------
+# Authentication and rate limiting
+#
+# Everything under /api is private except health and the auth routes. This app
+# holds a user's library and spends real model credits, so an open endpoint is
+# both a data leak and someone else's bill.
+# --------------------------------------------------------------------------
+
+_PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/register", "/api/auth/me"}
+
+# Per-IP ceilings on the routes that cost money or CPU. Fixed windows held in
+# memory: adequate for one instance, and honest about it - a multi-replica
+# deployment would need shared state.
+_RATE_LIMITS = {
+    "/api/discover/run": (5, 3600),
+    "/api/discover/projects": (30, 3600),
+    "/api/upload": (20, 3600),
+    "/api/import": (20, 3600),
+    "/api/auth/login": (10, 900),
+    "/api/auth/register": (5, 3600),
+}
+_rate_state: dict[str, list[float]] = {}
+_rate_lock = threading.Lock()
+
+
+def _rate_rule(path: str) -> tuple[str, int, int] | None:
+    for prefix, (limit, window) in _RATE_LIMITS.items():
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix, limit, window
+    return None
+
+
+def _rate_limited(client: str, path: str) -> bool:
+    rule = _rate_rule(path)
+    if rule is None:
+        return False
+    prefix, limit, window = rule
+    now = time.time()
+    key = f"{client}|{prefix}"
+    with _rate_lock:
+        hits = [t for t in _rate_state.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            _rate_state[key] = hits
+            return True
+        hits.append(now)
+        _rate_state[key] = hits
+    return False
+
+
+def current_user(request: Request) -> dict[str, Any] | None:
+    """The signed-in user, or None. Accepts a cookie or a bearer token, so a
+    native client can authenticate without cookie handling."""
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    if not token:
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+    return auth.user_for_token(token)
+
+
+def require_user(request: Request) -> dict[str, Any]:
+    user = current_user(request)
+    if user is None:
+        raise HTTPException(401, "Sign in to continue.")
+    return user
+
+
+@app.middleware("http")
+async def _guard(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        client = request.client.host if request.client else "unknown"
+        if _rate_limited(client, path):
+            return JSONResponse(
+                {"detail": "Too many requests. Wait a while and try again."},
+                status_code=429,
+            )
+        if path not in _PUBLIC_PATHS and current_user(request) is None:
+            return JSONResponse({"detail": "Sign in to continue."}, status_code=401)
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -49,6 +150,73 @@ def _startup() -> None:
     # Discovery runs live in this process; any left "running" died with the
     # previous one and would otherwise poll for ever.
     db.reap_orphaned_runs()
+    db.purge_expired_sessions()
+
+
+# --------------------------------------------------------------------------
+# Auth endpoints
+# --------------------------------------------------------------------------
+
+
+class CredentialsRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=200)
+
+
+def _issue_session(user_id: str, response: Response) -> str:
+    token = auth.start_session(user_id)
+    response.set_cookie(
+        auth.SESSION_COOKIE,
+        token,
+        max_age=auth.SESSION_DAYS * 24 * 3600,
+        httponly=True,          # unreadable from JavaScript, so XSS cannot lift it
+        samesite="lax",         # blocks the cookie on cross-site form posts
+        secure=not os.getenv("ALLOW_INSECURE_COOKIE"),
+    )
+    return token
+
+
+@app.post("/api/auth/register")
+async def register(request: CredentialsRequest, response: Response) -> dict[str, Any]:
+    try:
+        user = auth.register(request.email, request.password)
+    except auth.AuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    token = _issue_session(user["id"], response)
+    return {
+        "user": {"id": user["id"], "email": user["email"]},
+        "claimed": user["claimed"],
+        "token": token,
+    }
+
+
+@app.post("/api/auth/login")
+async def login(request: CredentialsRequest, response: Response) -> dict[str, Any]:
+    try:
+        user = auth.authenticate(request.email, request.password)
+    except auth.AuthError as exc:
+        raise HTTPException(401, str(exc)) from exc
+
+    token = _issue_session(user["id"], response)
+    return {"user": user, "token": token}
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request, response: Response) -> dict[str, Any]:
+    auth.end_session(request.cookies.get(auth.SESSION_COOKIE) or "")
+    response.delete_cookie(auth.SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def me(request: Request) -> dict[str, Any]:
+    """Who am I, and does anyone exist yet?
+
+    `setup_needed` lets the client show "create the first account" instead of
+    a login form on a fresh deployment.
+    """
+    return {"user": current_user(request), "setup_needed": db.count_users() == 0}
 
 
 # --------------------------------------------------------------------------
@@ -136,7 +304,7 @@ def _normalise_paper_url(raw: str) -> str:
 # --------------------------------------------------------------------------
 
 
-async def _ingest(data: bytes, filename: str) -> dict[str, Any]:
+async def _ingest(data: bytes, filename: str, owner_id: str) -> dict[str, Any]:
     if not data:
         raise HTTPException(400, "The uploaded file is empty.")
     if not data.startswith(b"%PDF"):
@@ -196,6 +364,7 @@ async def _ingest(data: bytes, filename: str) -> dict[str, Any]:
         full_text=extracted["text"],
         sections=extracted["sections"],
         analysis=result,
+        owner_id=owner_id,
     )
 
     return {
@@ -255,7 +424,9 @@ async def models() -> dict[str, Any]:
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload(
+    file: UploadFile = File(...), user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Stage 1: extract the PDF and run the structured analysis."""
     filename = file.filename or "paper.pdf"
     if not filename.lower().endswith(".pdf"):
@@ -272,11 +443,13 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
             raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
         chunks.append(chunk)
 
-    return await _ingest(b"".join(chunks), filename)
+    return await _ingest(b"".join(chunks), filename, user["id"])
 
 
 @app.post("/api/import")
-async def import_from_url(request: ImportRequest) -> dict[str, Any]:
+async def import_from_url(
+    request: ImportRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Ingest a paper straight from an arXiv or DOI link."""
     url = _normalise_paper_url(request.url.strip())
     limit = MAX_UPLOAD_MB * 1024 * 1024
@@ -328,13 +501,13 @@ async def import_from_url(request: ImportRequest) -> dict[str, Any]:
     name = url.rstrip("/").split("/")[-1] or "paper"
     if not name.lower().endswith(".pdf"):
         name = f"{name}.pdf"
-    return await _ingest(data, name)
+    return await _ingest(data, name, user["id"])
 
 
 @app.post("/api/papers/{paper_id}/ground")
-async def ground(paper_id: str) -> dict[str, Any]:
+async def ground(paper_id: str, user: dict = Depends(require_user)) -> dict[str, Any]:
     """Stage 2: check each gap against later literature."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(paper_id, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
     if not paper.get("analysis"):
@@ -350,14 +523,16 @@ async def ground(paper_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/papers")
-def papers() -> list[dict[str, Any]]:
-    return db.list_papers()
+def papers(user: dict = Depends(require_user)) -> list[dict[str, Any]]:
+    return db.list_papers(owner_id=user["id"])
 
 
 @app.get("/api/papers/{paper_id}")
-def paper_detail(paper_id: str, include_text: bool = False) -> dict[str, Any]:
+def paper_detail(
+    paper_id: str, include_text: bool = False, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """include_text adds the full extracted text - large, so opt-in only."""
-    paper = db.get_paper(paper_id, include_text=include_text)
+    paper = db.get_paper(paper_id, include_text=include_text, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
     paper["messages"] = db.get_messages(paper_id)
@@ -365,10 +540,10 @@ def paper_detail(paper_id: str, include_text: bool = False) -> dict[str, Any]:
 
 
 @app.delete("/api/papers/{paper_id}")
-def paper_delete(paper_id: str) -> dict[str, str]:
-    if not db.get_paper(paper_id):
+def paper_delete(paper_id: str, user: dict = Depends(require_user)) -> dict[str, str]:
+    if not db.get_paper(paper_id, owner_id=user["id"]):
         raise HTTPException(404, "Paper not found.")
-    db.delete_paper(paper_id)
+    db.delete_paper(paper_id, owner_id=user["id"])
     return {"status": "deleted"}
 
 
@@ -378,8 +553,10 @@ def paper_delete(paper_id: str) -> dict[str, str]:
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest) -> dict[str, str]:
-    paper = db.get_paper(request.paper_id, include_text=True)
+async def chat(
+    request: ChatRequest, user: dict = Depends(require_user)
+) -> dict[str, str]:
+    paper = db.get_paper(request.paper_id, include_text=True, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
 
@@ -400,9 +577,14 @@ async def chat(request: ChatRequest) -> dict[str, str]:
 
 
 @app.post("/api/chat/library")
-async def chat_library(request: LibraryChatRequest) -> dict[str, Any]:
+async def chat_library(
+    request: LibraryChatRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Ask a question across every paper in the library."""
-    papers = [db.get_paper(item["id"]) for item in db.list_papers()]
+    papers = [
+        db.get_paper(item["id"], owner_id=user["id"])
+        for item in db.list_papers(owner_id=user["id"])
+    ]
     papers = [p for p in papers if p]
 
     try:
@@ -414,10 +596,12 @@ async def chat_library(request: LibraryChatRequest) -> dict[str, Any]:
 
 
 @app.post("/api/compare")
-async def compare(request: CompareRequest) -> dict[str, Any]:
+async def compare(
+    request: CompareRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     papers_data = []
     for paper_id in request.paper_ids:
-        paper = db.get_paper(paper_id)
+        paper = db.get_paper(paper_id, owner_id=user["id"])
         if not paper:
             raise HTTPException(404, f"Paper {paper_id} not found.")
         papers_data.append(paper)
@@ -444,9 +628,9 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
 
 
 @app.get("/api/papers/{paper_id}/citation")
-def citation(paper_id: str) -> dict[str, Any]:
+def citation(paper_id: str, user: dict = Depends(require_user)) -> dict[str, Any]:
     """IEEE / APA / MLA / Chicago / BibTeX for one paper."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(paper_id, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
     metadata = (paper.get("analysis") or {}).get("metadata") or {}
@@ -454,9 +638,11 @@ def citation(paper_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/papers/{paper_id}/export")
-def export_report(paper_id: str, format: str = "md") -> Response:
+def export_report(
+    paper_id: str, format: str = "md", user: dict = Depends(require_user)
+) -> Response:
     """Download the report as markdown, pdf or docx."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(paper_id, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
 
@@ -492,9 +678,11 @@ def export_report(paper_id: str, format: str = "md") -> Response:
 
 
 @app.post("/api/papers/{paper_id}/topic")
-async def topic(paper_id: str, request: TopicRequest) -> dict[str, Any]:
+async def topic(
+    paper_id: str, request: TopicRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Turn one open gap into a concrete project proposal."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(paper_id, owner_id=user["id"])
     if not paper:
         raise HTTPException(404, "Paper not found.")
 
@@ -521,11 +709,13 @@ async def topic(paper_id: str, request: TopicRequest) -> dict[str, Any]:
 
 
 @app.post("/api/review")
-async def review(request: ReviewRequest) -> dict[str, Any]:
+async def review(
+    request: ReviewRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Generate a Related Work chapter across several papers."""
     papers_data = []
     for paper_id in request.paper_ids:
-        paper = db.get_paper(paper_id)
+        paper = db.get_paper(paper_id, owner_id=user["id"])
         if not paper:
             raise HTTPException(404, f"Paper {paper_id} not found.")
         papers_data.append(paper)
@@ -604,30 +794,38 @@ class ProjectRunRequest(BaseModel):
 
 
 @app.post("/api/discover/projects")
-async def create_project(request: ProjectRequest) -> dict[str, Any]:
-    project_id = db.create_project(request.topic.strip(), request.goal.strip() or "gaps")
-    return {"project": db.get_project(project_id)}
+async def create_project(
+    request: ProjectRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
+    project_id = db.create_project(
+        request.topic.strip(), request.goal.strip() or "gaps", owner_id=user["id"]
+    )
+    return {"project": db.get_project(project_id, owner_id=user["id"])}
 
 
 @app.get("/api/discover/projects")
-async def list_projects() -> dict[str, Any]:
-    projects = db.list_projects()
+async def list_projects(user: dict = Depends(require_user)) -> dict[str, Any]:
+    projects = db.list_projects(owner_id=user["id"])
     return {"count": len(projects), "projects": projects}
 
 
 @app.get("/api/discover/projects/{project_id}")
-async def get_project(project_id: str) -> dict[str, Any]:
-    project = db.get_project(project_id)
+async def get_project(
+    project_id: str, user: dict = Depends(require_user)
+) -> dict[str, Any]:
+    project = db.get_project(project_id, owner_id=user["id"])
     if project is None:
         raise HTTPException(404, "Project not found.")
     return {"project": project, "runs": db.list_runs(project_id)}
 
 
 @app.delete("/api/discover/projects/{project_id}")
-async def delete_project(project_id: str) -> dict[str, Any]:
-    if db.get_project(project_id) is None:
+async def delete_project(
+    project_id: str, user: dict = Depends(require_user)
+) -> dict[str, Any]:
+    if db.get_project(project_id, owner_id=user["id"]) is None:
         raise HTTPException(404, "Project not found.")
-    db.delete_project(project_id)
+    db.delete_project(project_id, owner_id=user["id"])
     return {"deleted": project_id}
 
 
@@ -657,9 +855,12 @@ async def _execute_run(
 
 @app.post("/api/discover/projects/{project_id}/runs")
 async def start_project_run(
-    project_id: str, request: ProjectRunRequest, background: BackgroundTasks
+    project_id: str,
+    request: ProjectRunRequest,
+    background: BackgroundTasks,
+    user: dict = Depends(require_user),
 ) -> dict[str, Any]:
-    project = db.get_project(project_id)
+    project = db.get_project(project_id, owner_id=user["id"])
     if project is None:
         raise HTTPException(404, "Project not found.")
 
@@ -677,11 +878,98 @@ async def start_project_run(
 
 
 @app.get("/api/discover/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
-    run = db.get_run(run_id)
-    if run is None:
-        raise HTTPException(404, "Run not found.")
+async def get_run(run_id: str, user: dict = Depends(require_user)) -> dict[str, Any]:
+    run = _owned_run(run_id, user)
     return {"run": run}
+
+
+def _owned_run(run_id: str, user: dict) -> dict[str, Any]:
+    """Fetch a run, or 404 unless it belongs to this user.
+
+    Runs carry no owner of their own; ownership comes from the parent project.
+    Without this check a signed-in user could read or re-challenge someone
+    else's research by guessing a run id.
+    """
+    run = db.get_run(run_id)
+    if run is None or db.get_project(run["project_id"], owner_id=user["id"]) is None:
+        raise HTTPException(404, "Run not found.")
+    return run
+
+
+@app.get("/api/discover/runs/{run_id}/export")
+def export_discovery(
+    run_id: str, format: str = "md", user: dict = Depends(require_user)
+) -> Response:
+    """Download a discovery run as a report."""
+    run = _owned_run(run_id, user)
+
+    fmt = format.lower().lstrip(".")
+    if fmt not in ("md", "markdown"):
+        # The PDF and DOCX builders are shaped around a single analysed paper;
+        # a run has a different structure, so claiming support would be a lie.
+        raise HTTPException(400, "Discovery reports are available as md.")
+
+    content = export_service.discovery_markdown(run).encode("utf-8")
+    filename = export_service.safe_discovery_filename(run, "md")
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class SavePaperRequest(BaseModel):
+    paper_index: int = Field(ge=0, le=99)
+
+
+@app.post("/api/discover/runs/{run_id}/save-paper")
+async def save_discovered_paper(
+    run_id: str, request: SavePaperRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
+    """Move a paper found by discovery into the library.
+
+    Discovery analyses abstracts and then discards the papers, so a promising
+    result could not be chatted with, grounded or exported. This carries it
+    across instead of making the user hunt down the PDF again.
+    """
+    run = _owned_run(run_id, user)
+    papers = (run.get("result") or {}).get("papers") or []
+    if request.paper_index >= len(papers):
+        raise HTTPException(404, "That paper is not in this run.")
+
+    work = papers[request.paper_index]
+    title = work.get("title") or "Untitled"
+    abstract = work.get("abstract") or ""
+    body = "\n".join(
+        [
+            f"Title: {title}",
+            f"Authors: {', '.join(work.get('authors') or [])}",
+            f"Year: {work.get('year', 'n.d.')}",
+            f"Venue: {work.get('venue', '')}",
+            "",
+            "Abstract:",
+            abstract or "(no abstract available)",
+        ]
+    )
+
+    try:
+        analysis = await analysis_service.analyse_paper(body)
+    except LLMError as exc:
+        raise HTTPException(502, f"Could not analyse that paper: {exc}") from exc
+
+    paper_id = uuid.uuid4().hex[:12]
+    db.save_paper(
+        paper_id=paper_id,
+        filename=work.get("openalex_url") or work.get("id") or title,
+        pages=0,                      # abstract-only: there is no PDF behind this
+        characters=len(abstract),
+        title=title,
+        full_text=body,
+        sections={},
+        analysis=analysis,
+        owner_id=user["id"],
+    )
+    return {"paper_id": paper_id, "title": title, "abstract_only": True}
 
 
 class ChallengeRequest(BaseModel):
@@ -689,16 +977,16 @@ class ChallengeRequest(BaseModel):
 
 
 @app.post("/api/discover/runs/{run_id}/challenge")
-async def challenge_gap(run_id: str, request: ChallengeRequest) -> dict[str, Any]:
+async def challenge_gap(
+    run_id: str, request: ChallengeRequest, user: dict = Depends(require_user)
+) -> dict[str, Any]:
     """Re-run adversarial validation for one opportunity in a finished run.
 
     The point of the feature is that a verdict is a claim, not a fact: the user
     can force the system to search again and try to disprove it. The verdict can
     move in either direction, including from `open` to `addressed`.
     """
-    run = db.get_run(run_id)
-    if run is None:
-        raise HTTPException(404, "Run not found.")
+    run = _owned_run(run_id, user)
 
     result = run.get("result") or {}
     opportunities = result.get("opportunities") or []

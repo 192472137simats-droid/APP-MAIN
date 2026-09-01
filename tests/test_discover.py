@@ -102,10 +102,10 @@ def test_limit_is_respected_and_clamped(monkeypatch):
 
 # --- endpoint --------------------------------------------------------------
 
-client = TestClient(app)  # no context manager -> app lifespan/startup not run -> no DB
 
 
-def test_endpoint_ok(monkeypatch):
+def test_endpoint_ok(monkeypatch, auth_client):
+    client = auth_client
     monkeypatch.setattr(literature, "_get", _fake_get([_raw_work("W1", "Topic paper", 2022, 100)]))
     resp = client.get("/api/discover/search", params={"q": "graph neural networks", "limit": 5})
     assert resp.status_code == 200
@@ -115,6 +115,7 @@ def test_endpoint_ok(monkeypatch):
     assert data["results"][0]["title"] == "Topic paper"
 
 
-def test_endpoint_rejects_empty_query():
+def test_endpoint_rejects_empty_query(auth_client):
+    client = auth_client
     assert client.get("/api/discover/search", params={"q": "   "}).status_code == 400
     assert client.get("/api/discover/search").status_code == 400

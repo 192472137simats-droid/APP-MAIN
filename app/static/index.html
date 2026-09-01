@@ -10,6 +10,38 @@
 </head>
 <body>
 
+<!-- Shown until /api/auth/me confirms a session; the app stays hidden behind it. -->
+<div id="auth-gate" class="auth-gate hidden">
+  <form class="auth-card" id="auth-form">
+    <div class="brand auth-brand">
+      <span class="brand-mark">RA</span>
+      <div>
+        <div class="brand-name">ResearchAdvisorLM</div>
+        <div class="brand-tag">Your AI research companion</div>
+      </div>
+    </div>
+
+    <h1 id="auth-title">Sign in</h1>
+    <p class="sub" id="auth-sub">Your library and research are private to your account.</p>
+
+    <label class="ask-label" for="auth-email">Email</label>
+    <input id="auth-email" class="ask-input" type="email" autocomplete="email" required />
+
+    <label class="ask-label" for="auth-password">Password</label>
+    <input id="auth-password" class="ask-input" type="password"
+           autocomplete="current-password" minlength="8" required />
+
+    <div id="auth-error" class="alert error hidden"></div>
+
+    <button class="btn primary" type="submit" id="auth-submit">Sign in</button>
+    <p class="ask-note">
+      <span id="auth-switch-text">No account yet?</span>
+      <button type="button" class="linkbtn" id="auth-switch">Create one</button>
+    </p>
+  </form>
+</div>
+
+
 <header class="topbar">
   <div class="brand" data-nav="library">
     <span class="brand-mark">RA</span>
@@ -23,6 +55,8 @@
     <button class="navbtn" data-nav="discover">Discover</button>
     <button class="navbtn" data-nav="library">Library</button>
     <button class="navbtn" data-nav="compare">Compare</button>
+    <span class="nav-user" id="nav-user"></span>
+    <button class="navbtn" id="signout-btn">Sign out</button>
   </nav>
 </header>
 
@@ -189,6 +223,7 @@
       <div id="run-meta" class="meta-row"></div>
       <div class="paper-actions">
         <button class="btn ghost" id="rerun-btn">Run again</button>
+        <button class="btn ghost" id="run-export-btn">Export report</button>
         <button class="btn ghost danger" id="delete-project-btn">Delete project</button>
       </div>
     </div>
@@ -206,6 +241,7 @@
     <div id="run-error" class="alert error hidden"></div>
     <div id="run-banner"></div>
     <div id="opportunities"></div>
+    <div id="run-papers"></div>
     <div id="run-history"></div>
   </section>
 

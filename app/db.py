@@ -86,9 +86,137 @@ def init() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_runs_project ON discovery_runs(project_id);
+
+            -- Accounts. Passwords are stored as a scrypt hash plus a per-user
+            -- salt; the plaintext never reaches the database.
+            CREATE TABLE IF NOT EXISTS users (
+                id            TEXT PRIMARY KEY,
+                email         TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt          TEXT NOT NULL,
+                created_at    TEXT NOT NULL
+            );
+
+            -- Opaque session tokens, kept server-side so logging out actually
+            -- revokes access - a self-contained signed cookie cannot.
+            CREATE TABLE IF NOT EXISTS sessions (
+                token      TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
             """
         )
         conn.commit()
+    _migrate_owner_columns()
+
+
+def _migrate_owner_columns() -> None:
+    """Add owner_id to the pre-auth tables, idempotently.
+
+    These tables existed before accounts did, so the column arrives by ALTER
+    TABLE rather than in CREATE TABLE. Existing rows keep owner_id NULL until
+    claim_unowned_rows() hands them to the first account.
+    """
+    conn = connect()
+    with _lock:
+        for table in ("papers", "discovery_projects"):
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if "owner_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+        conn.commit()
+
+
+# --- users and sessions ---------------------------------------------------
+
+
+def create_user(email: str, password_hash: str, salt: str) -> str:
+    user_id = uuid.uuid4().hex[:12]
+    conn = connect()
+    with _lock:
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, salt, created_at) VALUES (?,?,?,?,?)",
+            (user_id, email.strip().lower(), password_hash, salt, _now()),
+        )
+        conn.commit()
+    return user_id
+
+
+def get_user_by_email(email: str) -> dict[str, Any] | None:
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM users WHERE email = ?", (email.strip().lower(),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user(user_id: str) -> dict[str, Any] | None:
+    conn = connect()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def count_users() -> int:
+    conn = connect()
+    return conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+
+def create_session(user_id: str, token: str, expires_at: str) -> None:
+    conn = connect()
+    with _lock:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+            (token, user_id, _now(), expires_at),
+        )
+        conn.commit()
+
+
+def get_session_user(token: str) -> dict[str, Any] | None:
+    """Resolve a session token to its user, refusing expired tokens."""
+    conn = connect()
+    row = conn.execute(
+        """SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+           WHERE s.token = ? AND s.expires_at > ?""",
+        (token, _now()),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_session(token: str) -> None:
+    conn = connect()
+    with _lock:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+
+
+def purge_expired_sessions() -> int:
+    conn = connect()
+    with _lock:
+        cursor = conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (_now(),))
+        conn.commit()
+    return cursor.rowcount
+
+
+def claim_unowned_rows(user_id: str) -> dict[str, int]:
+    """Hand pre-auth data to its first owner.
+
+    Papers and projects created before accounts existed have no owner, so they
+    would be invisible to everyone. The first account to register inherits
+    them; later accounts start empty.
+    """
+    conn = connect()
+    with _lock:
+        papers = conn.execute(
+            "UPDATE papers SET owner_id = ? WHERE owner_id IS NULL", (user_id,)
+        ).rowcount
+        projects = conn.execute(
+            "UPDATE discovery_projects SET owner_id = ? WHERE owner_id IS NULL", (user_id,)
+        ).rowcount
+        conn.commit()
+    return {"papers": papers, "projects": projects}
 
 
 # --- papers ---------------------------------------------------------------
@@ -103,13 +231,14 @@ def save_paper(
     full_text: str,
     sections: dict,
     analysis: dict,
+    owner_id: str | None = None,
 ) -> None:
     conn = connect()
     with _lock:
         conn.execute(
             """INSERT OR REPLACE INTO papers
-               (id, filename, created_at, pages, characters, title, full_text, sections, analysis, grounding)
-               VALUES (?,?,?,?,?,?,?,?,?, COALESCE((SELECT grounding FROM papers WHERE id = ?), NULL))""",
+               (id, filename, created_at, pages, characters, title, full_text, sections, analysis, grounding, owner_id)
+               VALUES (?,?,?,?,?,?,?,?,?, COALESCE((SELECT grounding FROM papers WHERE id = ?), NULL), ?)""",
             (
                 paper_id,
                 filename,
@@ -121,6 +250,7 @@ def save_paper(
                 json.dumps(sections),
                 json.dumps(analysis),
                 paper_id,
+                owner_id,
             ),
         )
         conn.commit()
@@ -153,18 +283,34 @@ def _row_to_paper(row: sqlite3.Row, include_text: bool = False) -> dict[str, Any
     return paper
 
 
-def get_paper(paper_id: str, include_text: bool = False) -> dict[str, Any] | None:
+def get_paper(
+    paper_id: str, include_text: bool = False, owner_id: str | None = None
+) -> dict[str, Any] | None:
+    """Fetch one paper. Passing owner_id scopes the lookup to that user, so a
+    guessed id from another account reads as missing rather than forbidden."""
     conn = connect()
-    row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    if owner_id is None:
+        row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM papers WHERE id = ? AND owner_id = ?", (paper_id, owner_id)
+        ).fetchone()
     return _row_to_paper(row, include_text) if row else None
 
 
-def list_papers() -> list[dict[str, Any]]:
+def list_papers(owner_id: str | None = None) -> list[dict[str, Any]]:
     conn = connect()
-    rows = conn.execute(
-        """SELECT id, filename, created_at, pages, characters, title, analysis, grounding
-           FROM papers ORDER BY created_at DESC"""
-    ).fetchall()
+    if owner_id is None:
+        rows = conn.execute(
+            """SELECT id, filename, created_at, pages, characters, title, analysis, grounding
+               FROM papers ORDER BY created_at DESC"""
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, filename, created_at, pages, characters, title, analysis, grounding
+               FROM papers WHERE owner_id = ? ORDER BY created_at DESC""",
+            (owner_id,),
+        ).fetchall()
     out = []
     for row in rows:
         analysis = json.loads(row["analysis"]) if row["analysis"] else {}
@@ -189,12 +335,20 @@ def list_papers() -> list[dict[str, Any]]:
     return out
 
 
-def delete_paper(paper_id: str) -> None:
+def delete_paper(paper_id: str, owner_id: str | None = None) -> int:
+    """Delete a paper and its chat. Returns rows removed, so a caller can tell
+    "deleted" from "was never yours"."""
     conn = connect()
     with _lock:
         conn.execute("DELETE FROM messages WHERE paper_id = ?", (paper_id,))
-        conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+        if owner_id is None:
+            cursor = conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+        else:
+            cursor = conn.execute(
+                "DELETE FROM papers WHERE id = ? AND owner_id = ?", (paper_id, owner_id)
+            )
         conn.commit()
+    return cursor.rowcount
 
 
 # --- chat -----------------------------------------------------------------
@@ -222,14 +376,16 @@ def get_messages(paper_id: str, limit: int = 40) -> list[dict[str, str]]:
 # --- discovery projects ---------------------------------------------------
 
 
-def create_project(topic: str, goal: str = "gaps") -> str:
+def create_project(topic: str, goal: str = "gaps", owner_id: str | None = None) -> str:
     project_id = uuid.uuid4().hex[:12]
     now = _now()
     conn = connect()
     with _lock:
         conn.execute(
-            "INSERT INTO discovery_projects (id, topic, goal, created_at, updated_at) VALUES (?,?,?,?,?)",
-            (project_id, topic, goal, now, now),
+            """INSERT INTO discovery_projects
+               (id, topic, goal, created_at, updated_at, owner_id)
+               VALUES (?,?,?,?,?,?)""",
+            (project_id, topic, goal, now, now, owner_id),
         )
         conn.commit()
     return project_id
@@ -245,15 +401,23 @@ def _row_to_project(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def get_project(project_id: str) -> dict[str, Any] | None:
+def get_project(project_id: str, owner_id: str | None = None) -> dict[str, Any] | None:
+    """Passing owner_id scopes the lookup, so another account's id reads as
+    missing rather than forbidden."""
     conn = connect()
-    row = conn.execute(
-        "SELECT * FROM discovery_projects WHERE id = ?", (project_id,)
-    ).fetchone()
+    if owner_id is None:
+        row = conn.execute(
+            "SELECT * FROM discovery_projects WHERE id = ?", (project_id,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM discovery_projects WHERE id = ? AND owner_id = ?",
+            (project_id, owner_id),
+        ).fetchone()
     return _row_to_project(row) if row else None
 
 
-def list_projects() -> list[dict[str, Any]]:
+def list_projects(owner_id: str | None = None) -> list[dict[str, Any]]:
     """Projects newest first, each with a lightweight run summary."""
     conn = connect()
     rows = conn.execute(
@@ -261,7 +425,10 @@ def list_projects() -> list[dict[str, Any]]:
                   (SELECT COUNT(*) FROM discovery_runs r WHERE r.project_id = p.id) AS run_count,
                   (SELECT r.status FROM discovery_runs r WHERE r.project_id = p.id
                    ORDER BY r.created_at DESC LIMIT 1) AS last_status
-           FROM discovery_projects p ORDER BY p.updated_at DESC"""
+           FROM discovery_projects p
+           WHERE (? IS NULL OR p.owner_id = ?)
+           ORDER BY p.updated_at DESC""",
+        (owner_id, owner_id),
     ).fetchall()
     out = []
     for row in rows:
@@ -272,14 +439,25 @@ def list_projects() -> list[dict[str, Any]]:
     return out
 
 
-def delete_project(project_id: str) -> None:
+def delete_project(project_id: str, owner_id: str | None = None) -> int:
+    """Returns rows removed, so a caller can tell "deleted" from "not yours"."""
     conn = connect()
     with _lock:
+        if owner_id is not None:
+            owned = conn.execute(
+                "SELECT 1 FROM discovery_projects WHERE id = ? AND owner_id = ?",
+                (project_id, owner_id),
+            ).fetchone()
+            if owned is None:
+                return 0
         # Explicit, because SQLite only enforces ON DELETE CASCADE when the
         # foreign_keys pragma is on, and this connection does not enable it.
         conn.execute("DELETE FROM discovery_runs WHERE project_id = ?", (project_id,))
-        conn.execute("DELETE FROM discovery_projects WHERE id = ?", (project_id,))
+        cursor = conn.execute(
+            "DELETE FROM discovery_projects WHERE id = ?", (project_id,)
+        )
         conn.commit()
+    return cursor.rowcount
 
 
 # --- discovery runs -------------------------------------------------------

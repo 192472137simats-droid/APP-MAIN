@@ -31,6 +31,13 @@ function toast(message, ms = 2600) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
+  // A session can expire mid-visit. Send the user back to the gate once,
+  // rather than letting every later action fail with its own error.
+  if (response.status === 401 && !path.startsWith("/api/auth/")) {
+    stopPolling();
+    showGate(false);
+    throw new Error("Your session expired. Sign in again.");
+  }
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
     try {
@@ -965,7 +972,60 @@ function renderRun(run) {
   $$("#opportunities [data-challenge]").forEach((btn) =>
     btn.addEventListener("click", () => challengeGap(run.id, btn.dataset.challenge, btn))
   );
+
+  renderRunPapers(run, result.papers || []);
 }
+
+function renderRunPapers(run, papers) {
+  const holder = $("#run-papers");
+  if (!papers.length) return (holder.innerHTML = "");
+
+  holder.innerHTML = `
+    <div class="view-head projects-head"><h2>Papers read</h2></div>
+    <p class="sub">Discovery reads abstracts. Save one to your library to chat with
+    it, ground its gaps, or export it.</p>
+    <div class="cards">
+      ${papers
+        .map(
+          (p, index) => `
+        <div class="card" data-save="${index}">
+          <div class="card-title">${esc(p.title || "Untitled")}</div>
+          <div class="card-meta">
+            ${p.year ? `<span>${esc(p.year)}</span>` : ""}
+            <span>${p.cited_by_count ?? 0} citations</span>
+            <span class="linkbtn">Save to library</span>
+          </div>
+        </div>`
+        )
+        .join("")}
+    </div>`;
+
+  $$("#run-papers [data-save]").forEach((card) =>
+    card.addEventListener("click", () => savePaperToLibrary(run.id, card))
+  );
+}
+
+async function savePaperToLibrary(runId, card) {
+  const label = card.querySelector(".linkbtn");
+  label.textContent = "Analysing…";
+  try {
+    const result = await api(`/api/discover/runs/${runId}/save-paper`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paper_index: Number(card.dataset.save) }),
+    });
+    label.textContent = "Saved";
+    toast(`"${result.title}" added to your library`);
+  } catch (err) {
+    label.textContent = "Save to library";
+    toast(err.message, 4000);
+  }
+}
+
+$("#run-export-btn").addEventListener("click", () => {
+  if (!state.run) return toast("Nothing to export yet");
+  window.open(`/api/discover/runs/${state.run.id}/export?format=md`, "_blank");
+});
 
 async function pollRun(runId) {
   const { run } = await api(`/api/discover/runs/${runId}`);
@@ -1125,19 +1185,125 @@ async function openProject(projectId) {
   show("run");
 }
 
+/* ---------------- auth ---------------- */
+
+// "register" when the deployment has no accounts yet, otherwise "login".
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const registering = mode === "register";
+  $("#auth-title").textContent = registering ? "Create your account" : "Sign in";
+  $("#auth-sub").textContent = registering
+    ? "Your library and research stay private to this account."
+    : "Your library and research are private to your account.";
+  $("#auth-submit").textContent = registering ? "Create account" : "Sign in";
+  $("#auth-switch-text").textContent = registering
+    ? "Already have an account?"
+    : "No account yet?";
+  $("#auth-switch").textContent = registering ? "Sign in" : "Create one";
+  $("#auth-password").setAttribute(
+    "autocomplete",
+    registering ? "new-password" : "current-password"
+  );
+  $("#auth-error").classList.add("hidden");
+}
+
+$("#auth-switch").addEventListener("click", () =>
+  setAuthMode(authMode === "login" ? "register" : "login")
+);
+
+function showGate(setupNeeded) {
+  setAuthMode(setupNeeded ? "register" : "login");
+  if (setupNeeded) {
+    $("#auth-sub").textContent =
+      "No account exists yet. The first account created owns this library.";
+  }
+  $("#auth-gate").classList.remove("hidden");
+  $("#main").classList.add("hidden");
+  document.querySelector(".topbar").classList.add("hidden");
+}
+
+function hideGate(user) {
+  $("#auth-gate").classList.add("hidden");
+  $("#main").classList.remove("hidden");
+  document.querySelector(".topbar").classList.remove("hidden");
+  $("#nav-user").textContent = user?.email || "";
+}
+
+$("#auth-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const email = $("#auth-email").value.trim();
+  const password = $("#auth-password").value;
+  const button = $("#auth-submit");
+  const error = $("#auth-error");
+
+  error.classList.add("hidden");
+  button.disabled = true;
+  button.textContent = authMode === "register" ? "Creating…" : "Signing in…";
+
+  try {
+    const result = await api(`/api/auth/${authMode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    $("#auth-password").value = "";
+    hideGate(result.user);
+
+    const claimed = result.claimed;
+    if (claimed && (claimed.papers || claimed.projects)) {
+      toast(
+        `Welcome. ${claimed.papers} paper(s) and ${claimed.projects} project(s) are now yours.`
+      );
+    }
+    await startApp();
+  } catch (err) {
+    error.textContent = err.message;
+    error.classList.remove("hidden");
+    button.disabled = false;
+    setAuthMode(authMode);
+  }
+});
+
+$("#signout-btn").addEventListener("click", async () => {
+  stopPolling();
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } catch {
+    /* signing out locally matters more than the round trip succeeding */
+  }
+  window.location.reload();
+});
+
 /* ---------------- boot ---------------- */
 
-(async function boot() {
+async function startApp() {
   try {
     const health = await api("/api/health");
     if (!health.key_configured) {
-      showUploadError("No LLM_API_KEY configured on the server. Set it in your .env file or Railway variables.");
+      showUploadError(
+        "No LLM_API_KEY configured on the server. Set it in your .env file or Railway variables."
+      );
     }
-    if (health.papers > 0) loadLibrary();
+    await loadLibrary();
   } catch {
     /* server not reachable yet */
   }
-  // The health check is awaited, so the user may already have navigated by now;
+  // loadLibrary is awaited, so the user may already have navigated by now;
   // landing them back on Upload would undo a click they made deliberately.
   if (!state.navigated) show("upload");
+}
+
+(async function boot() {
+  try {
+    const { user, setup_needed: setupNeeded } = await api("/api/auth/me");
+    if (!user) return showGate(setupNeeded);
+    hideGate(user);
+  } catch {
+    // Server unreachable: show the gate rather than an empty shell that will
+    // 401 on every action.
+    return showGate(false);
+  }
+  await startApp();
 })();
