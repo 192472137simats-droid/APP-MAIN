@@ -112,6 +112,45 @@ def test_paper_mode_prompts_carry_the_untrusted_rule(prompt_name):
     assert "{rule}" in getattr(analysis, prompt_name)
 
 
+def test_every_prompt_format_call_supplies_all_placeholders():
+    """A placeholder with no matching argument only fails at call time.
+
+    That is exactly how /api/compare shipped broken: the prompt gained a
+    {rule} placeholder, the call site was never updated, and .format() raised
+    KeyError as a 500 in production instead of failing here.
+    """
+    import ast
+    import re
+    from pathlib import Path
+
+    source = Path("app/services/analysis.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    prompts = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.endswith("PROMPT"):
+                        prompts[target.id] = node.value.value
+
+    broken = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in prompts
+        ):
+            needed = set(re.findall(r"\{([a-z_]+)\}", prompts[node.func.value.id]))
+            supplied = {kw.arg for kw in node.keywords if kw.arg}
+            if needed - supplied:
+                broken.append((node.func.value.id, node.lineno, sorted(needed - supplied)))
+
+    assert not broken, f"prompt format calls missing arguments: {broken}"
+
+
 def test_paper_mode_prompts_still_format():
     """A stray placeholder would only fail at call time, in production."""
     from app.services import analysis

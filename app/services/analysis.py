@@ -399,7 +399,11 @@ async def compare_papers(papers: list[dict[str, Any]]) -> dict[str, Any]:
         )
 
     return await generate_json(
-        COMPARE_PROMPT.format(count=len(papers), papers="\n\n".join(blocks)),
+        COMPARE_PROMPT.format(
+            count=len(papers),
+            papers=fence_untrusted("\n\n".join(blocks)),
+            rule=UNTRUSTED_RULE,
+        ),
         COMPARE_SCHEMA,
         temperature=0.2,
     )
@@ -645,7 +649,10 @@ async def answer_across_library(
 
     return await generate_text(
         LIBRARY_CHAT_PROMPT.format(
-            count=len(papers), papers="\n\n".join(blocks), question=question
+            count=len(papers),
+            papers=fence_untrusted("\n\n".join(blocks)),
+            question=question,
+            rule=UNTRUSTED_RULE,
         ),
         history=history,
         temperature=0.3,
