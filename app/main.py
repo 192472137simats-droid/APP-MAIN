@@ -1,6 +1,7 @@
 """ResearchAdvisorLM - FastAPI backend + web client in one deployable service."""
 
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -39,6 +40,8 @@ from .services import llm_service
 from .services import pdf_service
 from .services.llm_service import LLMError
 from .services.pdf_service import PdfError
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -150,6 +153,7 @@ def _startup() -> None:
     # Discovery runs live in this process; any left "running" died with the
     # previous one and would otherwise poll for ever.
     db.reap_orphaned_runs()
+    db.reap_stalled_analyses()
     db.purge_expired_sessions()
 
 
@@ -304,7 +308,9 @@ def _normalise_paper_url(raw: str) -> str:
 # --------------------------------------------------------------------------
 
 
-async def _ingest(data: bytes, filename: str, owner_id: str) -> dict[str, Any]:
+async def _ingest(
+    data: bytes, filename: str, owner_id: str, background: BackgroundTasks
+) -> dict[str, Any]:
     if not data:
         raise HTTPException(400, "The uploaded file is empty.")
     if not data.startswith(b"%PDF"):
@@ -346,26 +352,25 @@ async def _ingest(data: bytes, filename: str, owner_id: str) -> dict[str, Any]:
             source="ocr",
         )
 
-    try:
-        result = await analysis_service.analyse_paper(extracted["body"])
-    except LLMError as exc:
-        raise HTTPException(502, f"AI analysis failed: {exc}") from exc
-
     paper_id = uuid.uuid4().hex[:12]
-    metadata = result.get("metadata") or {}
-    title = metadata.get("title") or extracted["pdf_title"] or filename
 
+    # The paper is stored before it is analysed. Analysis needs many minutes on
+    # a slow model and a platform proxy cuts the request long before that -
+    # which is exactly how upload failed with a 502 after 300s. The row exists
+    # immediately, the client polls, and _analyse_in_background completes it.
     db.save_paper(
         paper_id=paper_id,
         filename=filename,
         pages=extracted["pages"],
         characters=extracted["characters"],
-        title=title,
+        title=extracted["pdf_title"] or filename,
         full_text=extracted["text"],
         sections=extracted["sections"],
-        analysis=result,
+        analysis={},
         owner_id=owner_id,
+        analysis_status="pending",
     )
+    background.add_task(_analyse_in_background, paper_id, extracted["body"])
 
     return {
         "paper_id": paper_id,
@@ -375,8 +380,32 @@ async def _ingest(data: bytes, filename: str, owner_id: str) -> dict[str, Any]:
         "sections_detected": extracted["section_names"],
         "warnings": extracted["warnings"],
         "source": extracted["source"],
-        "analysis": result,
+        "analysis": None,
+        "analysis_status": "pending",
     }
+
+
+async def _analyse_in_background(paper_id: str, body: str) -> None:
+    """Analyse an already-stored paper, then complete its row.
+
+    Every exit path writes a terminal status; otherwise the client would poll a
+    paper that says "pending" for ever.
+    """
+    try:
+        result = await analysis_service.analyse_paper(body)
+    except LLMError as exc:
+        logger.warning("Analysis failed for paper %s: %s", paper_id, exc)
+        db.set_analysis(paper_id, None, f"AI analysis failed: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 - a crash must not strand the paper
+        logger.exception("Unexpected analysis failure for paper %s", paper_id)
+        db.set_analysis(paper_id, None, f"Unexpected error: {type(exc).__name__}")
+        return
+
+    db.set_analysis(paper_id, result)
+    title = (result.get("metadata") or {}).get("title")
+    if title:
+        db.set_title(paper_id, title)
 
 
 # --------------------------------------------------------------------------
@@ -425,7 +454,9 @@ async def models() -> dict[str, Any]:
 
 @app.post("/api/upload")
 async def upload(
-    file: UploadFile = File(...), user: dict = Depends(require_user)
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_user),
 ) -> dict[str, Any]:
     """Stage 1: extract the PDF and run the structured analysis."""
     filename = file.filename or "paper.pdf"
@@ -443,12 +474,14 @@ async def upload(
             raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit.")
         chunks.append(chunk)
 
-    return await _ingest(b"".join(chunks), filename, user["id"])
+    return await _ingest(b"".join(chunks), filename, user["id"], background)
 
 
 @app.post("/api/import")
 async def import_from_url(
-    request: ImportRequest, user: dict = Depends(require_user)
+    request: ImportRequest,
+    background: BackgroundTasks,
+    user: dict = Depends(require_user),
 ) -> dict[str, Any]:
     """Ingest a paper straight from an arXiv or DOI link."""
     url = _normalise_paper_url(request.url.strip())
@@ -501,7 +534,7 @@ async def import_from_url(
     name = url.rstrip("/").split("/")[-1] or "paper"
     if not name.lower().endswith(".pdf"):
         name = f"{name}.pdf"
-    return await _ingest(data, name, user["id"])
+    return await _ingest(data, name, user["id"], background)
 
 
 @app.post("/api/papers/{paper_id}/ground")

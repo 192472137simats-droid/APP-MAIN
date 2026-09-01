@@ -134,6 +134,7 @@ async function handleUpload(file) {
     setStep("extract", "done");
     setStep("analyze", "active");
     const result = await api("/api/upload", { method: "POST", body: form });
+    await waitForAnalysis(result.paper_id);
     setStep("analyze", "done");
 
     // Open the paper immediately — grounding continues in the background.
@@ -555,6 +556,8 @@ $("#import-form").addEventListener("submit", async (event) => {
       body: JSON.stringify({ url }),
     });
     setStep("extract", "done");
+    setStep("analyze", "active");
+    await waitForAnalysis(result.paper_id);
     setStep("analyze", "done");
     $("#import-url").value = "";
     await openPaper(result.paper_id, result.warnings);
@@ -567,6 +570,20 @@ $("#import-form").addEventListener("submit", async (event) => {
     setTimeout(() => $("#progress").classList.add("hidden"), 1200);
   }
 });
+
+/* Analysis now finishes after the upload response, so the client waits for the
+   paper row to leave "pending" instead of expecting a finished analysis. */
+async function waitForAnalysis(paperId, tries = 240) {
+  for (let i = 0; i < tries; i++) {
+    const paper = await api(`/api/papers/${paperId}`);
+    if (paper.analysis_status === "done") return paper;
+    if (paper.analysis_status === "error") {
+      throw new Error(paper.analysis_error || "Analysis failed.");
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  throw new Error("Analysis is taking unusually long. Check the library shortly.");
+}
 
 async function groundInBackground(paperId) {
   setStep("search", "active");

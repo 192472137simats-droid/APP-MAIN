@@ -127,6 +127,16 @@ def _migrate_owner_columns() -> None:
             columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
             if "owner_id" not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+
+        # Analysis now runs after the upload response is sent, so a paper has to
+        # record that it is still being worked on, or that the work failed.
+        paper_columns = {row["name"] for row in conn.execute("PRAGMA table_info(papers)")}
+        if "analysis_status" not in paper_columns:
+            conn.execute("ALTER TABLE papers ADD COLUMN analysis_status TEXT")
+            # Existing rows were analysed synchronously, so they are complete.
+            conn.execute("UPDATE papers SET analysis_status = 'done'")
+        if "analysis_error" not in paper_columns:
+            conn.execute("ALTER TABLE papers ADD COLUMN analysis_error TEXT")
         conn.commit()
 
 
@@ -232,13 +242,16 @@ def save_paper(
     sections: dict,
     analysis: dict,
     owner_id: str | None = None,
+    analysis_status: str = "done",
 ) -> None:
     conn = connect()
     with _lock:
         conn.execute(
             """INSERT OR REPLACE INTO papers
-               (id, filename, created_at, pages, characters, title, full_text, sections, analysis, grounding, owner_id)
-               VALUES (?,?,?,?,?,?,?,?,?, COALESCE((SELECT grounding FROM papers WHERE id = ?), NULL), ?)""",
+               (id, filename, created_at, pages, characters, title, full_text,
+                sections, analysis, grounding, owner_id, analysis_status)
+               VALUES (?,?,?,?,?,?,?,?,?,
+                       COALESCE((SELECT grounding FROM papers WHERE id = ?), NULL), ?, ?)""",
             (
                 paper_id,
                 filename,
@@ -251,9 +264,58 @@ def save_paper(
                 json.dumps(analysis),
                 paper_id,
                 owner_id,
+                analysis_status,
             ),
         )
         conn.commit()
+
+
+def set_analysis(paper_id: str, analysis: dict | None, error: str | None = None) -> None:
+    """Attach the finished analysis to a paper, or record why it failed.
+
+    Analysis happens after the upload response has already been sent, so the
+    row exists first and is completed here.
+    """
+    conn = connect()
+    with _lock:
+        conn.execute(
+            """UPDATE papers
+               SET analysis = ?, analysis_status = ?, analysis_error = ?
+               WHERE id = ?""",
+            (
+                json.dumps(analysis) if analysis is not None else None,
+                "error" if error else "done",
+                error,
+                paper_id,
+            ),
+        )
+        conn.commit()
+
+
+def set_title(paper_id: str, title: str) -> None:
+    """The real title only becomes known once analysis has read the paper."""
+    conn = connect()
+    with _lock:
+        conn.execute("UPDATE papers SET title = ? WHERE id = ?", (title, paper_id))
+        conn.commit()
+
+
+def reap_stalled_analyses() -> int:
+    """Fail papers still marked `pending` at startup.
+
+    Analysis runs in this process, so anything still pending when the app boots
+    died with the previous one and would otherwise be polled for ever.
+    """
+    conn = connect()
+    with _lock:
+        cursor = conn.execute(
+            """UPDATE papers
+               SET analysis_status = 'error',
+                   analysis_error = 'Analysis was interrupted when the server restarted.'
+               WHERE analysis_status = 'pending'"""
+        )
+        conn.commit()
+    return cursor.rowcount
 
 
 def save_grounding(paper_id: str, grounding: dict) -> None:
@@ -276,6 +338,8 @@ def _row_to_paper(row: sqlite3.Row, include_text: bool = False) -> dict[str, Any
         "title": row["title"],
         "analysis": json.loads(row["analysis"]) if row["analysis"] else None,
         "grounding": json.loads(row["grounding"]) if row["grounding"] else None,
+        "analysis_status": row["analysis_status"] or "done",
+        "analysis_error": row["analysis_error"],
     }
     if include_text:
         paper["full_text"] = row["full_text"]
@@ -302,12 +366,14 @@ def list_papers(owner_id: str | None = None) -> list[dict[str, Any]]:
     conn = connect()
     if owner_id is None:
         rows = conn.execute(
-            """SELECT id, filename, created_at, pages, characters, title, analysis, grounding
+            """SELECT id, filename, created_at, pages, characters, title, analysis,
+                  grounding, analysis_status, analysis_error
                FROM papers ORDER BY created_at DESC"""
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, filename, created_at, pages, characters, title, analysis, grounding
+            """SELECT id, filename, created_at, pages, characters, title, analysis,
+                      grounding, analysis_status, analysis_error
                FROM papers WHERE owner_id = ? ORDER BY created_at DESC""",
             (owner_id,),
         ).fetchall()
@@ -327,6 +393,8 @@ def list_papers(owner_id: str | None = None) -> list[dict[str, Any]]:
                 "year": meta.get("year"),
                 "authors": meta.get("authors", []),
                 "domain": meta.get("domain"),
+                "analysis_status": row["analysis_status"] or "done",
+                "analysis_error": row["analysis_error"],
                 "grounded": grounding is not None,
                 "open_gaps": sum(1 for g in gaps if g.get("verdict") == "open"),
                 "total_gaps": len(gaps) or len((analysis or {}).get("gaps", [])),

@@ -290,6 +290,75 @@ def test_oversized_download_is_refused(client, monkeypatch):
     assert response.status_code == 413
 
 
+# --- background analysis --------------------------------------------------
+
+
+def test_paper_is_stored_before_it_is_analysed(client, monkeypatch):
+    """Upload used to block on analysis and 502 at the proxy's 300s cut-off."""
+    from app import main
+    from app.services import analysis as analysis_service, pdf_service
+
+    monkeypatch.setattr(
+        pdf_service, "extract",
+        lambda data, filename: {
+            "pages": 1, "characters": 10, "text": "t", "sections": {},
+            "section_names": [], "warnings": [], "source": "pdf",
+            "pdf_title": "Draft Title", "needs_ocr": False, "body": "body",
+        },
+    )
+
+    async def slow_analyse(_body):
+        return {"metadata": {"title": "Real Title"}, "gaps": []}
+
+    monkeypatch.setattr(analysis_service, "analyse_paper", slow_analyse)
+
+    response = client.post(
+        "/api/upload", files={"file": ("p.pdf", b"%PDF-1.4 x", "application/pdf")}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis"] is None
+    assert body["analysis_status"] == "pending"
+
+    # TestClient drains background tasks before returning, so it is done by now.
+    paper = client.get(f"/api/papers/{body['paper_id']}").json()
+    assert paper["analysis_status"] == "done"
+    assert paper["title"] == "Real Title"
+
+
+def test_failed_analysis_is_recorded_on_the_paper(client, monkeypatch):
+    from app.services import analysis as analysis_service, pdf_service
+    from app.services.llm_service import LLMError
+
+    monkeypatch.setattr(
+        pdf_service, "extract",
+        lambda data, filename: {
+            "pages": 1, "characters": 10, "text": "t", "sections": {},
+            "section_names": [], "warnings": [], "source": "pdf",
+            "pdf_title": "Draft", "needs_ocr": False, "body": "body",
+        },
+    )
+
+    async def boom(_body):
+        raise LLMError("provider refused")
+
+    monkeypatch.setattr(analysis_service, "analyse_paper", boom)
+
+    body = client.post(
+        "/api/upload", files={"file": ("p.pdf", b"%PDF-1.4 x", "application/pdf")}
+    ).json()
+    paper = client.get(f"/api/papers/{body['paper_id']}").json()
+
+    assert paper["analysis_status"] == "error"
+    assert "provider refused" in paper["analysis_error"]
+
+
+def test_stalled_analyses_are_reaped_at_startup():
+    db.save_paper("p1", "a.pdf", 1, 10, "t", "x", {}, {}, analysis_status="pending")
+    assert db.reap_stalled_analyses() == 1
+    assert db.get_paper("p1")["analysis_status"] == "error"
+
+
 # --- interrupted runs -----------------------------------------------------
 
 
