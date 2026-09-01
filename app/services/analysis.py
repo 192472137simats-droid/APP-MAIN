@@ -401,7 +401,10 @@ async def compare_papers(papers: list[dict[str, Any]]) -> dict[str, Any]:
     return await generate_json(
         COMPARE_PROMPT.format(
             count=len(papers),
-            papers=fence_untrusted("\n\n".join(blocks)),
+            # Not fenced: the extra markers pushed this model into echoing the
+            # JSON schema instead of filling it in. The rule below still tells
+            # it to treat the papers as data.
+            papers="\n\n".join(blocks),
             rule=UNTRUSTED_RULE,
         ),
         COMPARE_SCHEMA,
