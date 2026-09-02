@@ -236,20 +236,50 @@ async def generate_json(
 
     raw = await _call(base, temperature=temperature, model=model, json_mode=True)
     try:
-        return json.loads(_extract_json(raw))
+        parsed = json.loads(_extract_json(raw))
+        if not _is_schema_echo(parsed, schema):
+            return parsed
+        correction = (
+            "That was the schema itself, not data. Output ONLY a JSON value that "
+            "conforms to it, filled in from the content above."
+        )
     except json.JSONDecodeError:
-        repair = base + [
-            {"role": "assistant", "content": raw[:4000]},
-            {
-                "role": "user",
-                "content": "That was not valid JSON. Output ONLY the corrected JSON value, nothing else.",
-            },
-        ]
-        raw2 = await _call(repair, temperature=0.0, model=model, json_mode=True)
-        try:
-            return json.loads(_extract_json(raw2))
-        except json.JSONDecodeError as exc:
-            raise LLMError(f"Model did not return valid JSON: {raw2[:300]}") from exc
+        correction = (
+            "That was not valid JSON. Output ONLY the corrected JSON value, nothing else."
+        )
+
+    repair = base + [
+        {"role": "assistant", "content": raw[:4000]},
+        {"role": "user", "content": correction},
+    ]
+    raw2 = await _call(repair, temperature=0.0, model=model, json_mode=True)
+    try:
+        parsed2 = json.loads(_extract_json(raw2))
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"Model did not return valid JSON: {raw2[:300]}") from exc
+
+    if _is_schema_echo(parsed2, schema):
+        raise LLMError("Model returned the schema instead of data.")
+    return parsed2
+
+
+def _is_schema_echo(parsed: Any, schema: dict[str, Any]) -> bool:
+    """True when the model handed back the schema rather than filling it in.
+
+    Small models sometimes copy the schema. That parses cleanly as JSON, so it
+    slips past the usual check and the caller gets a 200 carrying no data.
+    Detected structurally: schema keywords sitting where the schema's own
+    properties should be.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    if "properties" not in parsed:
+        return False
+    if str(parsed.get("type", "")).lower() not in ("object", ""):
+        return False
+    # A real payload would carry the schema's declared property names instead.
+    expected = set((schema.get("properties") or {}).keys())
+    return not (expected & set(parsed.keys()))
 
 
 async def generate_from_images(

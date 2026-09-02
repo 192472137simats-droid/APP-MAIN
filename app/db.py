@@ -108,6 +108,17 @@ def init() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+            -- Discovery analyses the same paper whenever two topics overlap,
+            -- and every re-run repeats the whole cost. Abstracts do not change,
+            -- so the structured analysis is cached by OpenAlex work id. Shared
+            -- across accounts on purpose: this is public bibliographic data,
+            -- never a user's own document.
+            CREATE TABLE IF NOT EXISTS paper_analysis_cache (
+                work_id    TEXT PRIMARY KEY,
+                analysis   TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()
@@ -137,6 +148,34 @@ def _migrate_owner_columns() -> None:
             conn.execute("UPDATE papers SET analysis_status = 'done'")
         if "analysis_error" not in paper_columns:
             conn.execute("ALTER TABLE papers ADD COLUMN analysis_error TEXT")
+        conn.commit()
+
+
+# --- analysis cache -------------------------------------------------------
+
+
+def get_cached_analysis(work_id: str) -> dict[str, Any] | None:
+    if not work_id:
+        return None
+    conn = connect()
+    row = conn.execute(
+        "SELECT analysis FROM paper_analysis_cache WHERE work_id = ?", (work_id,)
+    ).fetchone()
+    return json.loads(row["analysis"]) if row else None
+
+
+def cache_analysis(work_id: str, analysis: dict) -> None:
+    """Store a successful analysis. Failures are never cached, so a transient
+    provider error cannot become a permanent wrong answer."""
+    if not work_id or not analysis:
+        return
+    conn = connect()
+    with _lock:
+        conn.execute(
+            """INSERT OR REPLACE INTO paper_analysis_cache (work_id, analysis, created_at)
+               VALUES (?,?,?)""",
+            (work_id, json.dumps(analysis), _now()),
+        )
         conn.commit()
 
 
@@ -288,6 +327,19 @@ def set_analysis(paper_id: str, analysis: dict | None, error: str | None = None)
                 error,
                 paper_id,
             ),
+        )
+        conn.commit()
+
+
+def mark_analysis_pending(paper_id: str) -> None:
+    """Reset a paper so it can be analysed again, clearing the previous error."""
+    conn = connect()
+    with _lock:
+        conn.execute(
+            """UPDATE papers
+               SET analysis_status = 'pending', analysis_error = NULL
+               WHERE id = ?""",
+            (paper_id,),
         )
         conn.commit()
 

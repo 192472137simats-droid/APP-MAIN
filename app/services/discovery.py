@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 import httpx
 
+from .. import db
 from . import analysis, literature
 from .llm_service import UNTRUSTED_RULE, LLMError, fence_untrusted, generate_json
 
@@ -150,6 +151,17 @@ async def analyse_papers(
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def _one(index: int, work: dict[str, Any]) -> dict[str, Any]:
+        # An abstract does not change, so a paper seen in an earlier run is
+        # reused rather than re-analysed. Checked before the budget: a cache hit
+        # spends no model call, so it should not be charged one.
+        cached = db.get_cached_analysis(work.get("id") or "")
+        if cached:
+            progress(
+                "paper_analysed",
+                {"ok": True, "title": work.get("title"), "cached": True},
+            )
+            return {"index": index, "paper": work, "ok": True, "analysis": cached}
+
         async with semaphore:
             if budget is not None:
                 try:
@@ -159,6 +171,7 @@ async def analyse_papers(
             try:
                 result = await analysis.analyse_paper(_work_to_body(work))
                 record = {"index": index, "paper": work, "ok": True, "analysis": result}
+                db.cache_analysis(work.get("id") or "", result)
             except Exception as exc:  # noqa: BLE001 - isolate one paper's failure
                 record = {"index": index, "paper": work, "ok": False, "error": str(exc)[:200]}
             progress("paper_analysed", {"ok": record["ok"], "title": work.get("title")})

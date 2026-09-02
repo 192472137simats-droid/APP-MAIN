@@ -385,6 +385,33 @@ async def _ingest(
     }
 
 
+@app.post("/api/papers/{paper_id}/reanalyse")
+async def reanalyse(
+    paper_id: str,
+    background: BackgroundTasks,
+    user: dict = Depends(require_user),
+) -> dict[str, Any]:
+    """Re-run analysis for a paper whose first attempt failed or was cut short.
+
+    A deploy or crash mid-analysis leaves a paper unusable, and re-uploading the
+    PDF was the only way back. The extracted text is already stored, so a retry
+    costs one model call and no upload.
+    """
+    paper = db.get_paper(paper_id, include_text=True, owner_id=user["id"])
+    if paper is None:
+        raise HTTPException(404, "Paper not found.")
+    if paper.get("analysis_status") == "pending":
+        raise HTTPException(409, "This paper is already being analysed.")
+
+    body = paper.get("full_text") or ""
+    if not body.strip():
+        raise HTTPException(422, "No extracted text is stored for this paper.")
+
+    db.mark_analysis_pending(paper_id)
+    background.add_task(_analyse_in_background, paper_id, body)
+    return {"paper_id": paper_id, "analysis_status": "pending"}
+
+
 async def _analyse_in_background(paper_id: str, body: str) -> None:
     """Analyse an already-stored paper, then complete its row.
 

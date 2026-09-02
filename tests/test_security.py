@@ -359,6 +359,122 @@ def test_stalled_analyses_are_reaped_at_startup():
     assert db.get_paper("p1")["analysis_status"] == "error"
 
 
+# --- schema echo ----------------------------------------------------------
+
+COMPARE_LIKE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"rows": {"type": "ARRAY"}, "synthesis": {"type": "STRING"}},
+}
+
+
+def test_schema_echo_is_detected():
+    """The exact payload that made /api/compare return 200 with no data."""
+    echo = {
+        "type": "OBJECT",
+        "properties": {"rows": {"type": "ARRAY"}, "synthesis": {"type": "STRING"}},
+    }
+    assert llm_service._is_schema_echo(echo, COMPARE_LIKE_SCHEMA) is True
+
+
+def test_real_payload_is_not_mistaken_for_a_schema():
+    payload = {"rows": [{"aspect": "Objective", "values": ["a", "b"]}], "synthesis": "s"}
+    assert llm_service._is_schema_echo(payload, COMPARE_LIKE_SCHEMA) is False
+
+
+def test_payload_that_legitimately_has_properties_is_kept():
+    """A caller whose schema really declares `properties` must still work."""
+    schema = {"type": "OBJECT", "properties": {"properties": {"type": "ARRAY"}}}
+    payload = {"properties": ["a", "b"]}
+    assert llm_service._is_schema_echo(payload, schema) is False
+
+
+def test_non_dict_results_are_never_echoes():
+    assert llm_service._is_schema_echo([1, 2, 3], COMPARE_LIKE_SCHEMA) is False
+
+
+# --- retrying a failed analysis -------------------------------------------
+
+
+def test_failed_analysis_can_be_retried(client, monkeypatch):
+    """A paper lost to a restart must be recoverable without re-uploading."""
+    from app.services import analysis as analysis_service
+
+    user = db.get_user_by_email("tester@example.com")
+    db.save_paper(
+        "p1", "a.pdf", 1, 10, "Draft", "the extracted text", {}, {},
+        owner_id=user["id"], analysis_status="pending",
+    )
+    db.reap_stalled_analyses()
+    assert db.get_paper("p1")["analysis_status"] == "error"
+
+    async def ok(_body):
+        return {"metadata": {"title": "Recovered"}, "gaps": []}
+
+    monkeypatch.setattr(analysis_service, "analyse_paper", ok)
+
+    response = client.post("/api/papers/p1/reanalyse")
+    assert response.status_code == 200
+
+    paper = client.get("/api/papers/p1").json()
+    assert paper["analysis_status"] == "done"
+    assert paper["title"] == "Recovered"
+
+
+def test_retry_refuses_while_already_pending(client):
+    user = db.get_user_by_email("tester@example.com")
+    db.save_paper(
+        "p2", "a.pdf", 1, 10, "t", "text", {}, {},
+        owner_id=user["id"], analysis_status="pending",
+    )
+    assert client.post("/api/papers/p2/reanalyse").status_code == 409
+
+
+def test_retry_is_owner_scoped(client):
+    db.save_paper("p3", "a.pdf", 1, 10, "t", "text", {}, {}, owner_id="someone-else")
+    assert client.post("/api/papers/p3/reanalyse").status_code == 404
+
+
+# --- analysis cache -------------------------------------------------------
+
+
+def test_cache_round_trip_and_miss():
+    assert db.get_cached_analysis("W1") is None
+    db.cache_analysis("W1", {"objective": "x"})
+    assert db.get_cached_analysis("W1") == {"objective": "x"}
+
+
+def test_empty_analysis_is_never_cached():
+    """Caching a failure would make a transient error permanent."""
+    db.cache_analysis("W2", {})
+    assert db.get_cached_analysis("W2") is None
+
+
+def test_discovery_reuses_a_cached_paper(memory_db_local):
+    """The second run on an overlapping topic must not pay for analysis again."""
+    import asyncio
+
+    from app.services import discovery as disc
+
+    db.cache_analysis("W9", {"objective": "cached"})
+    calls = []
+
+    async def should_not_run(_body):
+        calls.append(1)
+        return {"objective": "fresh"}
+
+    original = disc.analysis.analyse_paper
+    disc.analysis.analyse_paper = should_not_run
+    try:
+        records = asyncio.run(
+            disc.analyse_papers([{"id": "W9", "title": "t", "abstract": "a"}])
+        )
+    finally:
+        disc.analysis.analyse_paper = original
+
+    assert calls == []
+    assert records[0]["analysis"] == {"objective": "cached"}
+
+
 # --- interrupted runs -----------------------------------------------------
 
 

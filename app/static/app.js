@@ -204,6 +204,29 @@ function renderPaper() {
 }
 
 function renderSummary() {
+  // A paper whose analysis failed or was cut short by a restart would otherwise
+  // render as an empty summary with no way forward.
+  if (state.paper.analysis_status === "error") {
+    $("#tab-summary").innerHTML = `
+      <div class="alert error">
+        ${esc(state.paper.analysis_error || "Analysis did not complete.")}
+      </div>
+      <div class="block">
+        <h3>Recover this paper</h3>
+        <p>The extracted text is already saved, so retrying costs one model call
+        and no re-upload.</p>
+        <button class="btn primary" id="retry-analysis">Retry analysis</button>
+      </div>`;
+    $("#retry-analysis").addEventListener("click", retryAnalysis);
+    return;
+  }
+  if (state.paper.analysis_status === "pending") {
+    $("#tab-summary").innerHTML = `
+      <div class="alert info">Analysing this paper. This can take a few minutes
+      on a free model — you can leave and come back.</div>`;
+    return;
+  }
+
   const analysis = state.paper.analysis || {};
   const summary = analysis.summary || {};
   const list = (items) =>
@@ -583,6 +606,22 @@ async function waitForAnalysis(paperId, tries = 240) {
     await new Promise((r) => setTimeout(r, 3000));
   }
   throw new Error("Analysis is taking unusually long. Check the library shortly.");
+}
+
+async function retryAnalysis() {
+  const button = $("#retry-analysis");
+  button.disabled = true;
+  button.textContent = "Analysing…";
+  try {
+    await api(`/api/papers/${state.paper.id}/reanalyse`, { method: "POST" });
+    await waitForAnalysis(state.paper.id);
+    await openPaper(state.paper.id);
+    toast("Analysis complete");
+  } catch (err) {
+    toast(err.message, 4000);
+    button.disabled = false;
+    button.textContent = "Retry analysis";
+  }
 }
 
 async function groundInBackground(paperId) {
