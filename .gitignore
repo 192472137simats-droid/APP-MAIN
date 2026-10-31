@@ -17,6 +17,7 @@ venv/
 
 # built artifacts
 *.apk
+/cpp/build/
 
 # local tooling
 .claude/

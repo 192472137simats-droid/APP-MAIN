@@ -1,5 +1,11 @@
 # ResearchAdvisorLM
 
+> **Integrated C++ mode:** the original Python app remains the main application,
+> preserving its complete multi-section interface, APIs, accounts, library,
+> literature grounding, discovery, chat, comparisons, and exports. The local C++
+> service handles structured paper analysis when started with the integrated
+> launcher. The standalone C++ demo is documented in [`cpp/`](cpp/README.md).
+
 **AI-Powered Research Paper Summarization and Research Gap Identification with Literature Grounding**
 
 Upload a research paper. Get a structured breakdown, then every research direction
@@ -70,7 +76,7 @@ verdicts and a citation list.
 
 | Layer | Choice | Why |
 |---|---|---|
-| Backend | FastAPI | async, one service, trivial to deploy |
+| Backend | FastAPI + C++17 analysis core | Keeps the original API and research workflows while moving structured paper analysis into C++ |
 | LLM | OpenAI-compatible API (OpenRouter by default) | swap OpenRouter / Groq / Mistral / Cerebras / local via 3 env vars; large context fits a whole paper, no chunking |
 | PDF | PyMuPDF | fast, column-aware block extraction |
 | Literature | OpenAlex API | free, no key, ~250M works |
@@ -95,6 +101,23 @@ uvicorn app.main:app --reload
 ```
 
 Open http://127.0.0.1:8000
+
+## Run the integrated Python + C++ app
+
+On Windows with the C++ dependencies listed in [`cpp/README.md`](cpp/README.md),
+run this from the repository root:
+
+```powershell
+.\scripts\run-integrated.ps1
+```
+
+The launcher builds and starts the C++ analysis core on `127.0.0.1:8081`, then
+starts the original FastAPI app on `127.0.0.1:8000`. Open
+<http://127.0.0.1:8000/> to use the original full interface. Analysis results
+return through the same Python API and are saved in the existing
+`data/researchadvisor.db`; the other research workflows stay in Python. Press
+Ctrl+C to stop both processes. Set `CPP_CORE_URL` to empty to run the original
+Python-only analysis path.
 
 Get a free API key at <https://openrouter.ai/keys> (no card needed). The app
 speaks the OpenAI-compatible protocol, so you can point it at a different

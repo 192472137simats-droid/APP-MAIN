@@ -52,3 +52,6 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "20"))
 MAX_PAPER_CHARS = int(os.getenv("MAX_PAPER_CHARS", "180000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "180"))
+# Empty keeps the original Python analysis path. The integrated launcher points
+# this at the local C++ service for structured paper analysis.
+CPP_CORE_URL = os.getenv("CPP_CORE_URL", "").strip().rstrip("/")

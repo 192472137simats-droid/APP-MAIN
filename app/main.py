@@ -29,11 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import db
-from .config import LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
+from .config import CPP_CORE_URL, LLM_API_KEY, LLM_MODEL, MAX_UPLOAD_MB, OCR_MAX_PAGES
 from .services import citations as citation_service
 from .services import export as export_service
 from .services import analysis as analysis_service
 from .services import auth
+from .services import cpp_core
 from .services import discovery
 from .services import literature
 from .services import llm_service
@@ -419,7 +420,10 @@ async def _analyse_in_background(paper_id: str, body: str) -> None:
     paper that says "pending" for ever.
     """
     try:
-        result = await analysis_service.analyse_paper(body)
+        if CPP_CORE_URL:
+            result = await cpp_core.analyse_paper(body)
+        else:
+            result = await analysis_service.analyse_paper(body)
     except LLMError as exc:
         logger.warning("Analysis failed for paper %s: %s", paper_id, exc)
         db.set_analysis(paper_id, None, f"AI analysis failed: {exc}")
