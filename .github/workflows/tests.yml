@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'app/**'
+      - 'cpp/**'
       - 'tests/**'
       - 'eval/**'
       - 'conftest.py'
@@ -30,6 +31,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
+
+      - name: Install C++ build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cmake g++ pkg-config libcurl4-openssl-dev libjsoncpp-dev \
+            libpoppler-cpp-dev libsqlite3-dev
+
+      - name: Build C++ server
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --parallel 2
 
       # The suite stubs the network and the LLM, so no API key is needed and a
       # run costs nothing. A missing secret must not turn into a red build.

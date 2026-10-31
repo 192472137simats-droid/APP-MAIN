@@ -19,8 +19,9 @@ import fitz
 
 
 ROOT = Path(__file__).resolve().parents[2]
-INTEGRATED_SERVER = ROOT / "cpp" / "build" / "integrated" / "research-advisor-server.exe"
-STANDALONE_SERVER = ROOT / "cpp" / "build" / "research-advisor-server.exe"
+SERVER_FILENAME = "research-advisor-server.exe" if os.name == "nt" else "research-advisor-server"
+INTEGRATED_SERVER = ROOT / "cpp" / "build" / "integrated" / SERVER_FILENAME
+STANDALONE_SERVER = ROOT / "cpp" / "build" / SERVER_FILENAME
 DEFAULT_SERVER = INTEGRATED_SERVER if INTEGRATED_SERVER.is_file() else STANDALONE_SERVER
 SERVER = Path(os.environ.get("RESEARCH_ADVISOR_SERVER", DEFAULT_SERVER))
 
