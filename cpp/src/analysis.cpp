@@ -208,12 +208,18 @@ std::string model_reply(const LlmConfig& config, const std::string& paper_text) 
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    const char* ca_bundle = std::getenv("CURL_CA_BUNDLE");
+    if (!ca_bundle || !*ca_bundle) ca_bundle = std::getenv("SSL_CERT_FILE");
+    if (ca_bundle && *ca_bundle) curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
     const CURLcode result = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
-    if (result != CURLE_OK) throw std::runtime_error("Model request failed or timed out.");
+    if (result != CURLE_OK) {
+        throw std::runtime_error(
+            std::string("Model request failed: ") + curl_easy_strerror(result));
+    }
     if (status != 200) {
         throw std::runtime_error("Model provider returned HTTP " + std::to_string(status) + ".");
     }

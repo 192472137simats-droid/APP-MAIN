@@ -20,8 +20,21 @@ if (-not (Test-Path $python)) {
 
 Push-Location $root
 $previousCoreUrl = $env:CPP_CORE_URL
+$previousCaBundle = $env:CURL_CA_BUNDLE
 $coreProcess = $null
 try {
+    if ([string]::IsNullOrWhiteSpace($env:CURL_CA_BUNDLE)) {
+        $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+        if ($null -ne $gitCommand) {
+            $gitRoot = Split-Path -Parent (Split-Path -Parent $gitCommand.Source)
+            $gitCaBundle = Join-Path $gitRoot 'mingw64\etc\ssl\cert.pem'
+            if ((Test-Path -LiteralPath $gitCaBundle -PathType Leaf) -and
+                (Get-Item -LiteralPath $gitCaBundle).Length -gt 0) {
+                $env:CURL_CA_BUNDLE = $gitCaBundle
+            }
+        }
+    }
+
     cmake -S cpp -B $buildDir -G Ninja
     if ($LASTEXITCODE -ne 0) { throw 'C++ core configuration failed.' }
 
@@ -86,6 +99,11 @@ try {
         Remove-Item Env:CPP_CORE_URL -ErrorAction SilentlyContinue
     } else {
         $env:CPP_CORE_URL = $previousCoreUrl
+    }
+    if ($null -eq $previousCaBundle) {
+        Remove-Item Env:CURL_CA_BUNDLE -ErrorAction SilentlyContinue
+    } else {
+        $env:CURL_CA_BUNDLE = $previousCaBundle
     }
     if ($null -ne $coreProcess -and -not $coreProcess.HasExited) {
         Stop-Process -Id $coreProcess.Id -Force
