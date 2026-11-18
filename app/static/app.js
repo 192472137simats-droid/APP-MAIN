@@ -94,7 +94,6 @@ $$(".tab").forEach((tab) =>
 const dropzone = $("#dropzone");
 const fileInput = $("#file-input");
 
-$("#browse-btn").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
   if (fileInput.files[0]) handleUpload(fileInput.files[0]);
 });
