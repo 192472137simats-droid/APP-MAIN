@@ -7,6 +7,9 @@ pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
 pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl)
 pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
 find_package(SQLite3 REQUIRED)
+if(NOT TARGET SQLite3::SQLite3) # CMake < 4.3
+    add_library(SQLite3::SQLite3 ALIAS SQLite::SQLite3)
+endif()
 find_package(Threads REQUIRED)
 
 add_executable(research-advisor-server
