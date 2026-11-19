@@ -421,7 +421,16 @@ async def _analyse_in_background(paper_id: str, body: str) -> None:
     """
     try:
         if CPP_CORE_URL:
-            result = await cpp_core.analyse_paper(body)
+            try:
+                result = await cpp_core.analyse_paper(body)
+            except LLMError:
+                # The C++ service is an optional acceleration path. Keep paper
+                # analysis available if that process or its upstream call fails.
+                logger.warning(
+                    "C++ analysis failed for paper %s; retrying with Python analysis",
+                    paper_id,
+                )
+                result = await analysis_service.analyse_paper(body)
         else:
             result = await analysis_service.analyse_paper(body)
     except LLMError as exc:

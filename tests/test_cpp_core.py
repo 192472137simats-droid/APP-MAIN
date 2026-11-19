@@ -100,16 +100,21 @@ def test_background_analysis_uses_python_unless_core_is_configured(monkeypatch):
     assert calls == ["python", "cpp"]
 
 
-def test_background_analysis_saves_core_failure_as_retryable_error(monkeypatch):
+def test_background_analysis_falls_back_to_python_if_core_is_unavailable(monkeypatch):
     from app import main
 
     persisted = []
+    python_result = {"metadata": {"title": "Python fallback"}}
 
     async def fail(_body):
         raise LLMError("The C++ analysis service returned HTTP 502.")
 
+    async def python_analysis(_body):
+        return python_result
+
     monkeypatch.setattr(main, "CPP_CORE_URL", "http://127.0.0.1:8081")
     monkeypatch.setattr(main.cpp_core, "analyse_paper", fail)
+    monkeypatch.setattr(main.analysis_service, "analyse_paper", python_analysis)
     monkeypatch.setattr(
         main.db,
         "set_analysis",
@@ -121,5 +126,5 @@ def test_background_analysis_saves_core_failure_as_retryable_error(monkeypatch):
     asyncio.run(main._analyse_in_background("paper-id", "paper body"))
 
     assert persisted == [
-        ("paper-id", None, "AI analysis failed: The C++ analysis service returned HTTP 502.")
+        ("paper-id", python_result, None)
     ]
