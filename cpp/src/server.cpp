@@ -404,6 +404,7 @@ void serve(socket_t client, const std::filesystem::path& static_dir,
             const std::string analysis = worker.analyze_text(request.body);
             respond(client, 200, "application/json; charset=utf-8", analysis);
         } catch (const std::exception& error) {
+            std::cerr << "C++ analysis request failed: " << error.what() << '\n' << std::flush;
             throw HttpError(502, error.what());
         }
         return;
